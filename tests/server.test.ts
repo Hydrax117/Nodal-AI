@@ -609,4 +609,61 @@ describe('backend/server.ts — health check HTTP server', () => {
       expect(res._statusCode).toBe(401);
     });
   });
+
+  describe('GET /stream (#964)', () => {
+    function makeStreamReq(url: string, headers: Record<string, string> = {}) {
+      const closeHandlers: Array<() => void> = [];
+      const req: any = makeReq('GET', url, headers);
+      req.on = vi.fn((event: string, handler: () => void) => {
+        if (event === 'close') closeHandlers.push(handler);
+      });
+      req._close = () => closeHandlers.forEach((h) => h());
+      return req as http.IncomingMessage & { _close: () => void };
+    }
+
+    function makeStreamRes() {
+      const res = makeRes() as any;
+      res.write = vi.fn();
+      return res as ReturnType<typeof makeRes> & { write: ReturnType<typeof vi.fn> };
+    }
+
+    it('a query string no longer 404s a route matched by pathname', () => {
+      process.env.ADMIN_API_TOKEN = 'admin-token';
+      createHealthServer();
+      const res = makeRes();
+
+      capturedHandler!(
+        makeReq('GET', '/status?limit=5', { authorization: 'Bearer admin-token' }),
+        res
+      );
+
+      expect(res._statusCode).toBe(200);
+    });
+
+    it('streams events for /stream?token=... instead of 404ing (#964)', () => {
+      process.env.ADMIN_API_TOKEN = 'admin-token';
+      createHealthServer();
+      const req = makeStreamReq('/stream?token=admin-token');
+      const res = makeStreamRes();
+
+      capturedHandler!(req, res);
+
+      expect(res._statusCode).toBe(200);
+      expect(res._headers['Content-Type']).toBe('text/event-stream');
+      expect(res.write).toHaveBeenCalledWith(expect.stringContaining('event: initial'));
+
+      req._close();
+    });
+
+    it('still rejects /stream without a valid token', () => {
+      process.env.ADMIN_API_TOKEN = 'admin-token';
+      createHealthServer();
+      const req = makeStreamReq('/stream?token=wrong');
+      const res = makeStreamRes();
+
+      capturedHandler!(req, res);
+
+      expect(res._statusCode).toBe(401);
+    });
+  });
 });
