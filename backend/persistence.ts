@@ -465,6 +465,9 @@ export interface PendingApproval {
   createdAt: number;
   expiresAt: number;
   decidedAt: number | null;
+  /** Name of the approver who made the final decision (#954), or "admin" when
+   * decided with the shared ADMIN_API_TOKEN. Null until decided. */
+  decidedBy: string | null;
 }
 
 export interface ApprovalAuditRow {
@@ -480,14 +483,16 @@ function toPendingApproval(row: ApprovalRow): PendingApproval {
 }
 
 /** Persist a newly held task in the `pending_approval` state. */
-export function savePendingApproval(approval: Omit<PendingApproval, 'status' | 'decidedAt'>): void {
+export function savePendingApproval(
+  approval: Omit<PendingApproval, 'status' | 'decidedAt' | 'decidedBy'>
+): void {
   getDb()
     .prepare(
       `INSERT INTO pending_approvals
-         (id, taskType, payload, amount, correlationId, status, createdAt, expiresAt, decidedAt)
+         (id, taskType, payload, amount, correlationId, status, createdAt, expiresAt, decidedAt, decidedBy)
        VALUES
          (@id, @taskType, @payload, @amount, @correlationId, 'pending_approval', @createdAt,
-          @expiresAt, NULL)`
+          @expiresAt, NULL, NULL)`
     )
     .run({ ...approval, payload: JSON.stringify(approval.payload ?? null) });
 }
@@ -519,25 +524,57 @@ export function listPendingApprovals(): PendingApproval[] {
 export function decideApproval(
   id: string,
   decision: 'approved' | 'denied',
-  now: number = Date.now()
+  now: number = Date.now(),
+  decidedBy: string | null = null
 ): boolean {
   const db = getDb();
   const decide = db.transaction((): boolean => {
     const info = db
       .prepare(
-        `UPDATE pending_approvals SET status = ?, decidedAt = ?
+        `UPDATE pending_approvals SET status = ?, decidedAt = ?, decidedBy = ?
          WHERE id = ? AND status = 'pending_approval' AND expiresAt > ?`
       )
-      .run(decision, now, id, now);
+      .run(decision, now, decidedBy, id, now);
     if (info.changes !== 1) return false;
     db.prepare(`INSERT INTO approval_audit_log (approvalId, decision, ts) VALUES (?, ?, ?)`).run(
       id,
       decision,
       now
     );
+    // The vote tally (if any) only mattered while this approval was pending.
+    db.prepare(`DELETE FROM approval_votes WHERE approvalId = ?`).run(id);
     return true;
   });
   return decide();
+}
+
+/**
+ * Record a distinct approver's "approve" vote for a held task (#954), for
+ * amounts above APPROVAL_MULTI_APPROVER_THRESHOLD. A second vote from the
+ * same approver is a no-op — it does not count twice.
+ *
+ * @returns the number of distinct approvers who have voted so far.
+ */
+export function recordApprovalVote(id: string, approver: string, now: number = Date.now()): number {
+  const db = getDb();
+  const vote = db.transaction((): number => {
+    db.prepare(
+      `INSERT OR IGNORE INTO approval_votes (approvalId, approver, decidedAt) VALUES (?, ?, ?)`
+    ).run(id, approver, now);
+    const { count } = db
+      .prepare(`SELECT COUNT(*) AS count FROM approval_votes WHERE approvalId = ?`)
+      .get(id) as { count: number };
+    return count;
+  });
+  return vote();
+}
+
+/** Names of every approver who has voted "approve" on a held task so far. */
+export function getApprovalVotes(id: string): string[] {
+  const rows = getDb()
+    .prepare(`SELECT approver FROM approval_votes WHERE approvalId = ? ORDER BY decidedAt ASC`)
+    .all(id) as Array<{ approver: string }>;
+  return rows.map((r) => r.approver);
 }
 
 /**
@@ -560,9 +597,11 @@ export function expirePendingApprovals(now: number = Date.now()): string[] {
     const audit = db.prepare(
       `INSERT INTO approval_audit_log (approvalId, decision, ts) VALUES (?, 'expired', ?)`
     );
+    const clearVotes = db.prepare(`DELETE FROM approval_votes WHERE approvalId = ?`);
     for (const { id } of rows) {
       update.run(now, id);
       audit.run(id, now);
+      clearVotes.run(id);
     }
     return rows.map((r) => r.id);
   });

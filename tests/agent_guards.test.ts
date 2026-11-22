@@ -585,7 +585,12 @@ describe('PayFiAgent guards', () => {
     } as AgentTask;
 
     const saved = () => vi.mocked(savePendingApproval).mock.calls[0]![0];
-    const held = () => ({ ...saved(), status: 'pending_approval' as const, decidedAt: null });
+    const held = () => ({
+      ...saved(),
+      status: 'pending_approval' as const,
+      decidedAt: null,
+      decidedBy: null,
+    });
 
     beforeEach(() => {
       mutableConfig.APPROVAL_THRESHOLD = '500';

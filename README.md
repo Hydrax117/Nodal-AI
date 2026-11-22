@@ -361,6 +361,21 @@ Operators can freeze fund movement during an incident without stopping the proce
 curl -X POST -H "Authorization: Bearer $WEBHOOK_SECRET" http://localhost:3000/admin/pause
 ```
 
+### Human-in-the-Loop Approvals
+
+Value-moving tasks above a configured amount are held as `pending_approval` instead of executing immediately, until an operator decides via `POST /approvals/:id`.
+
+- `APPROVAL_THRESHOLD` sets a single global amount. `APPROVAL_THRESHOLDS` (#953) sets per-asset amounts instead — comma-separated `'CODE:THRESHOLD'` (XLM/native) or `'CODE:ISSUER:THRESHOLD'` (credit assets), e.g. `XLM:5000,USDC:GA5Z…:500` — with `APPROVAL_THRESHOLD` as the fallback for any asset not listed. Comparisons are exact BigInt stroops, never a float parse, so two different assets' amounts are never pooled into one number.
+- `GET /approvals` lists pending approvals; `POST /approvals/:id { "decision": "approve" | "deny" }` decides one.
+- **Named approvers (#954):** `APPROVER_TOKENS='name:sha256hex,...'` gives each approver their own credential — distinct from `ADMIN_API_TOKEN` — so the token that submits tasks doesn't have to be the one that approves them. The decision is recorded as `decidedBy` (the matched name, or `"admin"` for the shared token) on the approval and in the audit log. Compute a token's hash with e.g. `printf '%s' 'the-raw-token' | sha256sum`.
+- **2-of-N consensus (#954):** above `APPROVAL_MULTI_APPROVER_THRESHOLD`, `"approve"` records a vote instead of deciding; the task only executes once `APPROVAL_MIN_APPROVERS` (default 2) *distinct* approvers have voted. `GET /approvals` shows each pending approval's `votes` so far. A single approver may still `"deny"` at any time — consensus is required to move money, not to block it.
+
+```bash
+curl -H "Authorization: Bearer $APPROVER_TOKEN" http://localhost:3000/approvals
+curl -X POST -H "Authorization: Bearer $APPROVER_TOKEN" -H "Content-Type: application/json" \
+  -d '{"decision":"approve"}' http://localhost:3000/approvals/<id>
+```
+
 ### Prometheus Metrics
 
 `GET /metrics` on the health server serves Prometheus text exposition (via `prom-client`, see `backend/metrics.ts`). It always requires `Authorization: Bearer <WEBHOOK_SECRET>` and returns `401` when `WEBHOOK_SECRET` is not configured. Send `Accept: application/json` to get the JSON LLM/spending snapshot instead.

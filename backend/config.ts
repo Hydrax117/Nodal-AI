@@ -178,7 +178,8 @@ export const EnvSchema = z.object({
 
   // Human-in-the-loop approval: value-moving tasks above this amount are held
   // as pending_approval until approved or denied via POST /approvals/:id.
-  // Unset = no approval step.
+  // Unset = no approval step. Acts as the fallback for any asset not listed
+  // in APPROVAL_THRESHOLDS (#953).
   APPROVAL_THRESHOLD: z
     .string()
     .regex(
@@ -186,8 +187,88 @@ export const EnvSchema = z.object({
       "APPROVAL_THRESHOLD must be a positive decimal (e.g. '500' or '50.0000000')"
     )
     .optional(),
+  /**
+   * Per-asset approval thresholds (#953), so e.g. 100 XLM and 100 of a
+   * high-value asset aren't held to the same bar. Same shape as
+   * SPENDING_LIMITS: comma-separated 'CODE:LIMIT' (XLM/native) or
+   * 'CODE:ISSUER:LIMIT' (credit assets), e.g. 'XLM:5000,USDC:GA5Z…:500'.
+   * An asset not listed here falls back to APPROVAL_THRESHOLD.
+   */
+  APPROVAL_THRESHOLDS: z
+    .string()
+    .optional()
+    .refine(
+      (val) => {
+        if (!val) return true;
+        const limitRe = /^[1-9]\d*(\.\d{1,7})?$/;
+        const g56Re = /^G[A-Z2-7]{55}$/;
+        for (const entry of val.split(',')) {
+          const parts = entry.trim().split(':');
+          if (parts.length === 2) {
+            const [, limit] = parts as [string, string];
+            if (!limitRe.test(limit)) return false;
+          } else if (parts.length === 3) {
+            const [, issuer, limit] = parts as [string, string, string];
+            if (!g56Re.test(issuer)) return false;
+            if (!limitRe.test(limit)) return false;
+          } else {
+            return false;
+          }
+        }
+        return true;
+      },
+      {
+        message:
+          'APPROVAL_THRESHOLDS must be a comma-separated list of ' +
+          "'ASSET_CODE:THRESHOLD' (for XLM/native) or " +
+          "'ASSET_CODE:ISSUER:THRESHOLD' (for credit assets), " +
+          "e.g. 'XLM:5000,USDC:GA5Z…:500'",
+      }
+    ),
   // How long a pending approval waits for a decision before it expires.
   APPROVAL_TTL_MS: z.coerce.number().int().min(1_000).default(3_600_000),
+
+  /**
+   * Named approver credentials (#954): 'name:sha256hex,...' — each approver
+   * gets their own token, distinct from ADMIN_API_TOKEN, so the audit trail
+   * can say who decided and (optionally) require several of them to agree.
+   * The token itself is never stored, only its SHA-256 hex digest.
+   */
+  APPROVER_TOKENS: z
+    .string()
+    .optional()
+    .refine(
+      (val) => {
+        if (!val) return true;
+        const hashRe = /^[0-9a-f]{64}$/i;
+        for (const entry of val.split(',')) {
+          const parts = entry.trim().split(':');
+          if (parts.length !== 2) return false;
+          const [name, hash] = parts as [string, string];
+          if (!name || !hashRe.test(hash)) return false;
+        }
+        return true;
+      },
+      {
+        message:
+          "APPROVER_TOKENS must be a comma-separated list of 'name:sha256hex', " +
+          "e.g. 'alice:9f86d0...,bob:2c26b4...'",
+      }
+    ),
+  /**
+   * Above this amount, an approval needs APPROVAL_MIN_APPROVERS distinct
+   * approvers to agree before it executes (#954). Unset = single-approver
+   * mode for every amount, regardless of APPROVAL_THRESHOLD(S).
+   */
+  APPROVAL_MULTI_APPROVER_THRESHOLD: z
+    .string()
+    .regex(
+      /^(?!0+(\.0+)?$)\d+(\.\d{1,7})?$/,
+      "APPROVAL_MULTI_APPROVER_THRESHOLD must be a positive decimal (e.g. '5000')"
+    )
+    .optional(),
+  // Distinct approvers required above APPROVAL_MULTI_APPROVER_THRESHOLD.
+  APPROVAL_MIN_APPROVERS: z.coerce.number().int().min(2).default(2),
 
   // Counterparty policy for value-moving tasks: `allowlist` permits only the
   // listed destinations, `denylist` blocks them, `open` (default) permits any.
@@ -541,14 +622,39 @@ export interface AgentConfig {
   /**
    * Amount above which a value-moving task is held as `pending_approval` until
    * an operator approves or denies it. Optional — when unset no task is held.
+   * Used as the fallback for any asset not listed in APPROVAL_THRESHOLDS_MAP.
    */
   readonly APPROVAL_THRESHOLD?: string | undefined;
+
+  /**
+   * Parsed form of APPROVAL_THRESHOLDS (#953): asset key ("XLM" or
+   * "CODE:ISSUER", matching backend/spending_tracker.ts's assetKey()) to its
+   * threshold. Empty when APPROVAL_THRESHOLDS is unset.
+   */
+  readonly APPROVAL_THRESHOLDS_MAP: ReadonlyMap<string, string>;
 
   /**
    * How long (ms) a pending approval waits for a decision before it expires and
    * its spending reservation is released. Defaults to 3,600,000 (1 hour).
    */
   readonly APPROVAL_TTL_MS: number;
+
+  /**
+   * Parsed form of APPROVER_TOKENS (#954): approver name to the SHA-256 hex
+   * digest of their token. Empty when APPROVER_TOKENS is unset — approval
+   * decisions are then only attributed to "admin" (the shared API token).
+   */
+  readonly APPROVER_TOKENS_MAP: ReadonlyMap<string, string>;
+
+  /**
+   * Above this amount, an approval needs APPROVAL_MIN_APPROVERS distinct
+   * approvers before it executes (#954). Optional — unset keeps the
+   * single-approver behaviour for every amount.
+   */
+  readonly APPROVAL_MULTI_APPROVER_THRESHOLD?: string | undefined;
+
+  /** Distinct approvers required above APPROVAL_MULTI_APPROVER_THRESHOLD. Defaults to 2. */
+  readonly APPROVAL_MIN_APPROVERS: number;
 
   /**
    * Counterparty policy enforced for every value-moving task.
@@ -1006,6 +1112,30 @@ function parseConfigAndDerive(
     }
   }
 
+  // ── Parse per-asset approval thresholds (#953) ─────────────────────────────
+  const approvalThresholdsMap = new Map<string, string>();
+  if (raw.APPROVAL_THRESHOLDS) {
+    for (const entry of raw.APPROVAL_THRESHOLDS.split(',')) {
+      const parts = entry.trim().split(':');
+      if (parts.length === 2) {
+        const [code, threshold] = parts as [string, string];
+        approvalThresholdsMap.set(code.toUpperCase(), threshold);
+      } else if (parts.length === 3) {
+        const [code, issuer, threshold] = parts as [string, string, string];
+        approvalThresholdsMap.set(`${code.toUpperCase()}:${issuer}`, threshold);
+      }
+    }
+  }
+
+  // ── Parse named approver tokens (#954) ─────────────────────────────────────
+  const approverTokensMap = new Map<string, string>();
+  if (raw.APPROVER_TOKENS) {
+    for (const entry of raw.APPROVER_TOKENS.split(',')) {
+      const [name, hash] = entry.trim().split(':') as [string, string];
+      approverTokensMap.set(name, hash.toLowerCase());
+    }
+  }
+
   // ── HTTP API auth guard ────────────────────────────────────────────────────
   // /status and /spending expose payment history and spending data. Without a
   // token the server would serve them to anyone, so mainnet refuses to start;
@@ -1105,6 +1235,8 @@ function parseConfigAndDerive(
     ALLOWED_X402_ORIGINS,
     AGENT_SECRET_KEY_ARN,
     SPENDING_LIMITS: _rawLimits,
+    APPROVAL_THRESHOLDS: _rawApprovalThresholds,
+    APPROVER_TOKENS: _rawApproverTokens,
     OTLP_ENDPOINT,
     WEBHOOK_URL,
     WEBHOOK_SECRET,
@@ -1139,6 +1271,8 @@ function parseConfigAndDerive(
     X402_NONCE_TTL_MS: raw.X402_NONCE_TTL_MS,
     MAX_SOROBAN_FEE_STROOPS: raw.MAX_SOROBAN_FEE_STROOPS,
     SPENDING_LIMITS_MAP: spendingLimitsMap,
+    APPROVAL_THRESHOLDS_MAP: approvalThresholdsMap,
+    APPROVER_TOKENS_MAP: approverTokensMap,
     SPENDING_LIMITS_ALLOW_UNKNOWN: raw.SPENDING_LIMITS_ALLOW_UNKNOWN,
     PAYMENT_DESTINATIONS: paymentDestinations,
     X402_ASSET_CONTRACT: x402AssetContract,
