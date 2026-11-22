@@ -60,7 +60,7 @@ export function redactSecrets(value: unknown): unknown {
   return value;
 }
 
-export const logger = pino({
+const pinoOptions = {
   level: config.LOG_LEVEL ?? 'info',
   redact: {
     paths: REDACT_PATHS,

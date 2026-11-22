@@ -829,8 +829,12 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
   /**
    * Start polling the Horizon payment stream for incoming x402 challenges.
    * Calls onChallenge for each payment whose memo starts with "x402:".
+   * The callback receives both the parsed challenge and the raw Horizon payment object.
    */
-  startListening(resourceUrl: string, onChallenge: (challenge: X402Challenge) => void): void {
+  startListening(
+    resourceUrl: string,
+    onChallenge: (challenge: X402Challenge, rawPayment: any) => void,
+  ): void {
     if (this._streamStop) return; // already listening
 
     const closeStream = horizonServer
@@ -843,7 +847,7 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
           try {
             const raw: unknown = JSON.parse(Buffer.from(memo.slice(5), 'base64').toString('utf8'));
             const challenge: X402Challenge = X402ChallengeSchema.parse(raw);
-            onChallenge(challenge);
+            onChallenge(challenge, payment);
           } catch (err) {
             // Malformed or schema-invalid memo — log and drop rather than
             // forwarding to onChallenge (or letting Zod's error surface
