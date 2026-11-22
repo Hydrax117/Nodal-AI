@@ -28,6 +28,7 @@
     "setup": "npx ts-node scripts/setup.ts",
     "doctor": "npx ts-node scripts/doctor.ts",
     "audit:verify": "npx ts-node scripts/audit_verify.ts",
+    "db:prune": "npx ts-node scripts/db_prune.ts",
     "build": "tsc && node -e \"require('fs').cpSync('backend/db/migrations', 'dist/backend/db/migrations', { recursive: true })\"",
     "build:lib": "tsc --project tsconfig.lib.json",
     "build:lib:esm": "tsc --project tsconfig.lib.esm.json",

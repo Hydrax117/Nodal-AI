@@ -207,6 +207,14 @@ export const EnvSchema = z.object({
   STORAGE_BACKEND: z.enum(['sqlite', 'postgres']).default('sqlite'),
   DATABASE_URL: z.string().min(1).optional(),
 
+  // Data retention (#963): how long to keep rows in tables that otherwise
+  // grow without bound. The hash-chained audit log is never pruned.
+  RETENTION_DAYS_RESULTS: z.coerce.number().int().positive().default(30),
+  RETENTION_DAYS_APPROVALS: z.coerce.number().int().positive().default(30),
+  RETENTION_DAYS_TRIGGER_EVENTS: z.coerce.number().int().positive().default(30),
+  // How often the retention job sweeps every table above (default: daily).
+  RETENTION_JOB_INTERVAL_MS: z.coerce.number().int().min(1_000).default(86_400_000),
+
   // Logging
   NODE_ENV: z.string().min(1).default('development'),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
@@ -503,6 +511,15 @@ export interface AgentConfig {
    * Contains credentials — never logged.
    */
   readonly DATABASE_URL?: string | undefined;
+
+  /** Days to keep persisted agent_results rows before the retention job deletes them (#963). */
+  readonly RETENTION_DAYS_RESULTS: number;
+  /** Days to keep decided/expired pending_approvals rows before the retention job deletes them (#963). */
+  readonly RETENTION_DAYS_APPROVALS: number;
+  /** Days to keep trigger_events dedupe rows before the retention job deletes them (#963). */
+  readonly RETENTION_DAYS_TRIGGER_EVENTS: number;
+  /** How often the retention job runs, in milliseconds. Defaults to once a day. */
+  readonly RETENTION_JOB_INTERVAL_MS: number;
 
   /**
    * The asset code for the x402 / PayFi asset.

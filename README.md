@@ -182,6 +182,14 @@ docker compose --profile postgres run --rm test-runner-postgres
 
 Schema changes are numbered SQL files in [`backend/db/migrations/`](./backend/db/migrations/) (`postgres/` holds the Postgres equivalents). Pending files are applied at startup inside a transaction and recorded in `schema_version`. To change the schema, add the next `NNN_<name>.sql` for both backends. Never edit a migration that has already shipped.
 
+### Data Retention (#963)
+
+`agent_results`, decided/expired `pending_approvals` and `trigger_events` dedupe rows grow without bound for a long-running agent. A daily job (`backend/retention.ts`, interval set by `RETENTION_JOB_INTERVAL_MS`) deletes rows older than `RETENTION_DAYS_RESULTS`, `RETENTION_DAYS_APPROVALS` and `RETENTION_DAYS_TRIGGER_EVENTS` respectively (all default to 30 days), and opportunistically prunes expired idempotency keys and x402 rate-limit records past their own windows. The hash-chained `audit_log` is never touched — pruning it would break the chain. Run the same sweep on demand, or from an external cron instead of in-process, with:
+
+```bash
+npm run db:prune
+```
+
 ### Visual Dashboard
 
 A web-based dashboard provides real-time monitoring and control of your Nodal agent:

@@ -95,6 +95,15 @@ export function saveResult(result: PersistedResult): void {
     });
 }
 
+/**
+ * Drop agent_results rows older than `beforeIso` (#963). ISO-8601 timestamps
+ * compare correctly as plain strings, so no numeric conversion is needed.
+ */
+export function pruneResults(beforeIso: string): number {
+  const result = getDb().prepare(`DELETE FROM agent_results WHERE timestamp < ?`).run(beforeIso);
+  return result.changes;
+}
+
 export function getResults(limit = 100, offset = 0): PersistedResult[] {
   const rows = getDb()
     .prepare(
@@ -545,6 +554,18 @@ export function expirePendingApprovals(now: number = Date.now()): string[] {
     return rows.map((r) => r.id);
   });
   return expire();
+}
+
+/**
+ * Drop `pending_approvals` rows that reached a terminal state (approved,
+ * denied or expired) before `beforeMs` (#963). Still-pending rows are never
+ * touched, and `approval_audit_log` — the decision trail — is left intact.
+ */
+export function pruneDecidedApprovals(beforeMs: number): number {
+  const result = getDb()
+    .prepare(`DELETE FROM pending_approvals WHERE status != 'pending_approval' AND decidedAt < ?`)
+    .run(beforeMs);
+  return result.changes;
 }
 
 /** Every approval decision, oldest first. */

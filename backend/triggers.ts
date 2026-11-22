@@ -104,6 +104,21 @@ async function recordTriggerFired(triggerId: string, eventId: string): Promise<b
 }
 
 /**
+ * Drop trigger_events dedupe rows fired before `beforeIso` (#963). These
+ * exist only to make `recordTriggerFired` idempotent for a bounded replay
+ * window, so old rows carry no lasting value.
+ */
+export function pruneTriggerEvents(beforeIso: string): number {
+  try {
+    const result = getDb().prepare('DELETE FROM trigger_events WHERE fired_at < ?').run(beforeIso);
+    return result.changes;
+  } catch {
+    // Table doesn't exist yet
+    return 0;
+  }
+}
+
+/**
  * Check if event matches trigger filter.
  */
 function matchesFilter(event: unknown, filter: TriggerFilter): boolean {

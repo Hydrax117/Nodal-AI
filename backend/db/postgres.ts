@@ -137,6 +137,10 @@ export class PostgresStorage implements Storage {
     );
   }
 
+  async pruneResults(beforeIso: string): Promise<void> {
+    await this.pool.query(`DELETE FROM agent_results WHERE "timestamp" < $1`, [beforeIso]);
+  }
+
   // ─── Audit log ──────────────────────────────────────────────────────────────
 
   async appendAuditEntry(entry: AuditEntry): Promise<AuditRow> {
