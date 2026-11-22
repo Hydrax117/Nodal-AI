@@ -734,6 +734,7 @@ Each value below is a `BuiltinTaskType` wired into `PayFiAgent.run()` in `backen
 | `offer_book` | `OfferBookTool` | Query the Stellar DEX order book for an asset pair and return bids, asks, and the top-of-book spread. Read-only. |
 | `cross_border_payment` | `CrossBorderPaymentTool` | SEP-31 payment as the sending anchor: SEP-12 KYC for sender and receiver, optional SEP-38 firm quote, SEP-31 transaction, then the on-chain payment with the anchor's memo. Spending limit enforced. |
 | `soroban_storage` | `SorobanStorageTool` | Read a Soroban contract's storage entry (`persistent`, `temporary`, or `instance`) and return the decoded value. Read-only. |
+| `claimable_balance` | `ClaimableBalanceTool` | Create a Stellar claimable balance for one or more claimants, or claim one the agent is entitled to. Spending limit enforced on create. |
 
 > **Standalone use:** read-only tools such as `BalanceCheckTool` (`backend/tools/BalanceCheckTool.ts`) and `SorobanQueryTool` (`backend/tools/SorobanQueryTool.ts`) can also be imported and used directly, outside the agent task loop, when you only need a query.
 
@@ -763,6 +764,7 @@ Input wrapper for task dispatch. The `payload` shape depends on `type`:
 - `network_status`: no payload fields (pass `{}`)
 - `offer_book`: `{ sellingAsset: string | { code: string; issuer?: string }; buyingAsset: string | { code: string; issuer?: string }; limit?: number }` (string assets are `"XLM"`, `"native"` or `"CODE:ISSUER"`; `limit` is 1–200)
 - `soroban_storage`: `{ contractId: string; keys: unknown[]; durability?: "persistent" | "temporary" | "instance" }` (exactly one key; `durability` defaults to `"persistent"`)
+- `claimable_balance`: `{ action: "create"; assetCode: string; assetIssuer?: string; amount: string; claimants: { destination: string; predicate?: ClaimPredicate }[] } | { action: "claim"; balanceId: string }` (spending limit enforced on `create`; `claim` verifies the agent is a listed claimant before submitting)
 - `swap`: `{ sellAsset: { code: string; issuer?: string }; buyAsset: { code: string; issuer?: string }; sellAmount: string; maxSlippagePct: number }` (`maxSlippagePct` is 0–100)
 - `account_history`: `{ publicKey?: string; limit?: number; cursor?: string; assetCode?: string }` (`limit` is 1–200, default 10, and counts *matching* payments after non-`payment` operations and the `assetCode` filter are dropped; the tool pages through Horizon to fill it, up to 5 pages per call. The result adds `pagesFetched` and `pageLimitReached` — when `pageLimitReached` is true, fewer than `limit` records does not mean history is exhausted; continue from `nextCursor`)
 - `soroban_deploy`: `{ action: "upload" | "deploy"; wasm?: Buffer | string; wasmBuffer?: Buffer | string }` or `{ action: "instantiate"; wasmHash: string }` — `upload`/`deploy` require WASM bytes (a `Buffer`, file path, hex or base64 string)

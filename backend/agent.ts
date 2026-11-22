@@ -65,6 +65,7 @@ import { SorobanEventIndexerTool } from './tools/SorobanEventIndexerTool';
 import { StellarIdentityTool } from './tools/StellarIdentityTool';
 import { FriendBotTool } from './tools/FriendBotTool';
 import { NanoPaymentTool } from './tools/NanoPaymentTool';
+import { ClaimableBalanceTool, type ClaimableBalanceInput } from './tools/ClaimableBalanceTool';
 import { listen as listenContractEvents } from './tools/ContractEventListener';
 import {
   watchContractStorage,
@@ -185,6 +186,12 @@ function taskSpends(task: AgentTask): TaskSpend[] {
     case 'dex_offer':
       // Only guard non-zero amounts (delete action sets amount to "0")
       return p.amount && p.amount !== '0' ? one(p.amount, assetObjectKey(p.selling)) : [];
+
+    case 'claimable_balance':
+      // Only creating a balance moves value; claiming one has no amount to guard.
+      return p.action === 'create'
+        ? one(p.amount, assetFieldsKey(p.assetCode, p.assetIssuer, 'XLM'))
+        : [];
 
     default:
       return [];
@@ -343,7 +350,8 @@ export type BuiltinTaskType =
   | 'ledger_info'
   | 'network_status'
   | 'offer_book'
-  | 'soroban_storage';
+  | 'soroban_storage'
+  | 'claimable_balance';
 
 /**
  * Any task type `run()` accepts: a built-in one, or the name of a tool added
@@ -467,6 +475,7 @@ export type TaskPayloadMap = {
   offer_book: { base: string; counter: string; limit?: number };
   soroban_storage: { contractId: string; key: string };
   transaction_build: { operations: unknown[]; fee?: string };
+  claimable_balance: ClaimableBalanceInput;
 };
 
 /**
@@ -516,6 +525,7 @@ export type TaskResultMap = {
   offer_book: { bids: unknown[]; asks: unknown[] };
   soroban_storage: { value: unknown };
   transaction_build: { envelopeXdr: string };
+  claimable_balance: { txHash: string; ledger: number };
 };
 
 export interface AgentResultData {
@@ -583,6 +593,7 @@ export const VALUE_MOVING_TASK_TYPES: ReadonlySet<TaskType> = new Set<TaskType>(
   'swap',
   'set_options',
   'cross_border_payment',
+  'claimable_balance',
 ]);
 
 // ─── Middleware types ─────────────────────────────────────────────────────────────
@@ -727,6 +738,7 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
   private stellarIdentityTool: StellarIdentityTool;
   private friendBotTool: FriendBotTool;
   private nanoPaymentTool: NanoPaymentTool;
+  private claimableBalanceTool: ClaimableBalanceTool;
 
   private activeTasks = 0;
   private isDraining = false;
@@ -787,6 +799,7 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
     this.stellarIdentityTool = new StellarIdentityTool(this.signer);
     this.friendBotTool = new FriendBotTool();
     this.nanoPaymentTool = new NanoPaymentTool();
+    this.claimableBalanceTool = new ClaimableBalanceTool(this.signer);
 
     for (const tool of createBuiltinTools(this.signer)) {
       this.registerTool(tool);
@@ -1507,6 +1520,10 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
 
           case 'nano_payment':
             data = await this.nanoPaymentTool.execute(task.payload);
+            break;
+
+          case 'claimable_balance':
+            data = await this.claimableBalanceTool.execute(task.payload);
             break;
 
           default: {
