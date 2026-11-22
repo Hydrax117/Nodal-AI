@@ -175,6 +175,8 @@ docker-compose --profile test-only up --build --abort-on-container-exit --exit-c
 
 State (spending window, x402 nonces, audit log, agent results) lives in SQLite at `DB_PATH` by default, which suits a single instance. To run several instances against one shared store, set `STORAGE_BACKEND=postgres` and `DATABASE_URL`. The `postgres` profile starts Postgres, a Postgres-backed agent on port 3001 and the shared storage test suite:
 
+The shared SQLite connection sets `journal_mode=WAL`, `busy_timeout=5000` and `foreign_keys=ON` on open (#962), so the health server, SSE polling and the agent contending for the same database file retry instead of failing with `SQLITE_BUSY` under load.
+
 ```bash
 docker compose --profile postgres up --build agent-postgres
 docker compose --profile postgres run --rm test-runner-postgres

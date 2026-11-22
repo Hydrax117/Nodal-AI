@@ -24,6 +24,27 @@ export type PersistedResult = AgentResult & { timestamp: string };
 let _db: Database.Database | null = null;
 
 /**
+ * Apply connection-level pragmas (#962): the health server, SSE polling and
+ * the agent all share this one connection, and SQLite's default rollback
+ * journal serialises every writer against every reader, which surfaces as
+ * SQLITE_BUSY under concurrent load.
+ *
+ *   - journal_mode=WAL: readers no longer block writers (or vice versa).
+ *     better-sqlite3 reports this back as "memory" for a `:memory:` database
+ *     (WAL needs a file), which is expected, not a failure to apply it.
+ *   - busy_timeout=5000: a writer that still contends (e.g. two WAL writers)
+ *     retries for up to 5s before throwing SQLITE_BUSY, instead of failing
+ *     immediately.
+ *   - foreign_keys=ON: off by default in SQLite; this schema relies on FK
+ *     constraints being enforced.
+ */
+function applyPragmas(db: Database.Database): void {
+  db.pragma('journal_mode = WAL');
+  db.pragma('busy_timeout = 5000');
+  db.pragma('foreign_keys = ON');
+}
+
+/**
  * Bring the schema up to date by applying the numbered migrations in
  * `backend/db/migrations/` (#821).
  *
@@ -32,6 +53,7 @@ let _db: Database.Database | null = null;
  * cannot drift apart.
  */
 function applySchema(db: Database.Database): void {
+  applyPragmas(db);
   migrateSqlite(db);
 }
 
