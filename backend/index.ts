@@ -10,11 +10,13 @@ import { db } from './db/client';
 import { createLogger } from './utils/logger';
 import { initTelemetry, shutdownTelemetry } from './telemetry';
 import { configPromise } from './config';
+import { startKillSwitchSync } from './kill_switch';
 
 const log = createLogger('process');
 
 let agent: PayFiAgent;
 let healthServer: any;
+let stopKillSwitchSync: (() => void) | undefined;
 const HARD_KILL_MS = 10_000;
 // Leave headroom inside the hard-kill window for the remaining teardown steps.
 export const PENDING_TASKS_TIMEOUT_MS = 8_000;
@@ -48,10 +50,13 @@ async function shutdown(signal: string): Promise<void> {
       );
     }
 
-    // 4. Close database connection
+    // 4. Stop the kill-switch sync poller
+    stopKillSwitchSync?.();
+
+    // 5. Close database connection
     await db.close();
 
-    // 5. Shut down telemetry (flushes pending spans)
+    // 6. Shut down telemetry (flushes pending spans)
     await shutdownTelemetry();
 
     clearTimeout(hardKill);
@@ -78,6 +83,7 @@ async function start() {
 
   agent = new PayFiAgent();
   healthServer = startHealthServer(agent);
+  stopKillSwitchSync = startKillSwitchSync();
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));

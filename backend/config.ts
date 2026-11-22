@@ -399,6 +399,10 @@ export const EnvSchema = z.object({
     .enum(['true', 'false'])
     .default('false')
     .transform((v) => v === 'true'),
+  // How often each instance re-reads the paused state from the shared storage
+  // backend (#960), so a pause/resume on one instance reaches the others
+  // within this bound. Only matters with multiple instances sharing one store.
+  KILL_SWITCH_SYNC_INTERVAL_MS: z.coerce.number().int().min(100).default(2_000),
 
   // Backward-compat: sign the body only (no timestamp). Deprecated — removed next release.
   WEBHOOK_LEGACY_SIGNATURE: z
@@ -816,6 +820,12 @@ export interface AgentConfig {
    * errorType AGENT_PAUSED until resumed via POST /admin/resume. Defaults to false.
    */
   readonly PAUSED: boolean;
+  /**
+   * How often (ms) each instance re-reads the paused state from the shared
+   * storage backend, so a pause/resume on one instance is picked up by every
+   * other instance sharing that store within this bound (#960). Defaults to 2000.
+   */
+  readonly KILL_SWITCH_SYNC_INTERVAL_MS: number;
 
   // ─── LLM Provider Configuration ─────────────────────────────────────────
 

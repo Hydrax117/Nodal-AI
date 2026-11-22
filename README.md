@@ -350,7 +350,8 @@ Operators can freeze fund movement during an incident without stopping the proce
 
 - `POST /admin/pause` and `POST /admin/resume` on the health server toggle it. Both require `Authorization: Bearer <WEBHOOK_SECRET>` and return `401` when `WEBHOOK_SECRET` is not configured.
 - `PAUSED=true` starts the agent paused.
-- The paused state is stored in the agent database (`DB_PATH`), so a paused agent stays paused across restarts until resumed.
+- The paused state is stored in the shared storage backend (SQLite or Postgres, whichever `STORAGE_BACKEND` selects), so a paused agent stays paused across restarts until resumed.
+- **Multi-instance sync (#960):** with several instances sharing one store, pausing/resuming one is picked up by the others within `KILL_SWITCH_SYNC_INTERVAL_MS` (default 2s) — each instance polls the shared state on that interval. The instance that issues the pause/resume takes effect immediately for itself.
 - While paused, every task that signs and submits a transaction (`VALUE_MOVING_TASK_TYPES` in `backend/agent.ts`) fails with `errorType: "AGENT_PAUSED"`.
 - Each pause/resume sends a webhook event: `{ "event": "agent.paused" | "agent.resumed", "paused": boolean, "reason"?: string, "timestamp": string }`.
 
