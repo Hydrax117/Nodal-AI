@@ -49,32 +49,6 @@
 
 import { Asset, Networks, xdr } from '@stellar/stellar-sdk';
 
-// Shared HTTP fetch helper with configurable timeout.
-export interface HttpFetchOptions {
-  /** Timeout in milliseconds (default from HTTP_TIMEOUT_MS env or 5000). */
-  timeoutMs?: number;
-  /** Additional fetch init options. */
-  init?: RequestInit;
-}
-
-/**
- * Perform a fetch with an AbortSignal timeout.
- * All backend outbound HTTP calls should use this instead of raw fetch.
- */
-export async function httpFetch(url: string, options: HttpFetchOptions = {}): Promise<Response> {
-  const { timeoutMs = Number(process.env.HTTP_TIMEOUT_MS) || 5000, init = {} } = options;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
-    clearTimeout(timeout);
-    return response;
-  } catch (err) {
-    clearTimeout(timeout);
-    throw err;
-  }
-}
-
 import { x402Client, x402HTTPClient } from '@x402/core/client';
 import type { PaymentRequired, PaymentRequirements, SettleResponse } from '@x402/core/types';
 import { ExactStellarScheme } from '@x402/stellar/exact/client';
@@ -85,7 +59,7 @@ import { createLogger } from '../utils/logger';
 import { fromStroops, toStroops, tryToStroops } from '../utils/amount';
 import { toCaip2 } from '../network';
 import { assetKey, spendingTracker } from '../spending_tracker';
-import { PolicyViolationError } from '../errors';
+import { PolicyViolationError, RpcUnavailableError } from '../errors';
 import type { Signer } from '../signer';
 import { resolveNetworkPassphrase, sorobanServer } from '../rpc_client';
 
@@ -216,6 +190,17 @@ function assetKeyForRequirement(asset: string): string {
 }
 
 /**
+ * Parses a PaymentRequirements' atomic `amount` string (stroops) into a
+ * bigint, rejecting anything that isn't a plain non-negative integer.
+ */
+function atomicAmountToStroops(amount: string): bigint {
+  if (!/^\d+$/.test(amount)) {
+    throw new Error(`x402 v2: invalid atomic amount "${amount}"`);
+  }
+  return BigInt(amount);
+}
+
+/**
  * Guard the amount from a PaymentRequirements against AGENT_SPENDING_LIMIT and
  * the mainnet hard cap. Throws with a clear message if either is exceeded.
  */
@@ -257,6 +242,22 @@ function assertPayToAllowed(payTo: string, selfAddress: string): void {
   if (policy === 'allowlist' ? !isListed : isListed) {
     throw new PolicyViolationError(
       `x402 v2: payTo ${payTo} is not permitted by the ${policy} payment destination policy`
+    );
+  }
+}
+
+/**
+ * Guard the target origin against ALLOWED_X402_ORIGINS, when configured.
+ * Unset (the default) allows any origin, preserving existing behavior.
+ */
+function assertOriginAllowed(url: URL): void {
+  const allowed = config.ALLOWED_X402_ORIGINS;
+  if (!allowed) return;
+
+  const origins = allowed.split(',').map((o) => o.trim());
+  if (!origins.includes(url.origin)) {
+    throw new PolicyViolationError(
+      `x402 v2: origin ${url.origin} is not permitted by ALLOWED_X402_ORIGINS`
     );
   }
 }
@@ -457,7 +458,7 @@ export class X402FetchClient {
 
     // ── 5. Reserve spend ─────────────────────────────────────────────────────
     const reservationId = spendingTracker.reserve(
-      chosen.amount,
+      fromStroops(amountStroops),
       assetKeyForRequirement(chosen.asset)
     );
 

@@ -15,7 +15,7 @@ import { config } from '../config';
 const isDev = config.NODE_ENV !== 'production';
 
 /** True when the process is acting as an MCP stdio server. */
-const isMCPStdio = process.env.MCP_TRANSPORT === 'stdio' || process.env.MCP_TRANSPORT === undefined;
+const isMCPStdio = config.MCP_TRANSPORT === 'stdio';
 
 // Transaction memos (e.g. the nonce slices X402PaymentTool writes) can carry
 // caller-supplied, potentially user-identifiable strings, so they're stripped
@@ -60,7 +60,7 @@ export function redactSecrets(value: unknown): unknown {
   return value;
 }
 
-export const logger = pino({
+const pinoOptions: pino.LoggerOptions = {
   level: config.LOG_LEVEL ?? 'info',
   redact: {
     paths: REDACT_PATHS,
@@ -83,9 +83,8 @@ export const logger = pino({
   }),
 };
 
-export const logger = isMCPStdio && !isDev
-  ? pino(pinoOptions, pino.destination(2))
-  : pino(pinoOptions);
+export const logger =
+  isMCPStdio && !isDev ? pino(pinoOptions, pino.destination(2)) : pino(pinoOptions);
 
 /**
  * Returns a child logger pre-tagged with `component` and an optional `correlationId`.
