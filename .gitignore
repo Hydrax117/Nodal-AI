@@ -26,5 +26,3 @@ Thumbs.db
 .coverage
 coverage/
 
-# Changelog / release notes generated during PR sessions
-docs/trigger-security-fixes.md
