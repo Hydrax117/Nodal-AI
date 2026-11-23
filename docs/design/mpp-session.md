@@ -65,6 +65,11 @@ This design follows the classic bidirectional payment channel pattern, adapted f
                   [Disputed]
 ```
 
+A periodic sweeper (`sweepExpiredChannels`, run at startup and every
+`MPP_SESSION_SWEEP_INTERVAL_MS`) moves `Active`/`Pending` channels past
+`timeoutAt` to `Expired`, releases their spending reservation and emits an
+operator alert.
+
 ### States
 
 | State | Description | Transitions |
@@ -73,6 +78,7 @@ This design follows the classic bidirectional payment channel pattern, adapted f
 | `Active` | Channel funded, accepting commits | `commit()` → `Active`, `close()` → `Closed` |
 | `Closed` | Channel settled on-chain, funds distributed | Terminal |
 | `Disputed` | Channel closed via dispute mechanism | Terminal |
+| `Expired` | `timeoutAt` elapsed; swept from `Active`/`Pending`, spending reservation released, operator alerted | Terminal |
 
 ### Core Operations
 
@@ -291,7 +297,7 @@ interface ChannelState {
   agentBalance: string;  // Current off-chain balance
   participantBalance: string;
   nonce: number;  // Commitment counter
-  status: 'Pending' | 'Active' | 'Closed' | 'Disputed';
+  status: 'Pending' | 'Active' | 'Closed' | 'Disputed' | 'Expired';
   openedAt: string;  // ISO timestamp
   timeoutAt: string;  // ISO timestamp
   closedAt?: string;
