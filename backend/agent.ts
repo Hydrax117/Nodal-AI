@@ -376,6 +376,10 @@ function assertDestinationsAllowed(task: AgentTask): void {
  * APPROVAL_THRESHOLD (#736): `sendAmount` for path payments, the sum of every
  * payment for batches, and `amount` otherwise. `null` when the task carries no
  * amount.
+ *
+ * Display/record purposes only — the approval-threshold *decision* is made by
+ * {@link findExceededApprovalThreshold}, which compares per-asset in BigInt
+ * stroops (#953) rather than this function's pooled, float-summed amount.
  */
 function taskAmount(task: AgentTask): string | null {
   const p = (task.payload ?? {}) as Record<string, unknown>;
@@ -392,6 +396,58 @@ function taskAmount(task: AgentTask): string | null {
   }
   const amount = task.type === 'path_payment' ? p.sendAmount : p.amount;
   return typeof amount === 'string' ? amount : null;
+}
+
+/**
+ * The approval threshold that applies to `assetKey`: the per-asset entry in
+ * APPROVAL_THRESHOLDS_MAP (#953) when listed, else the global
+ * APPROVAL_THRESHOLD. `undefined` when neither is configured for this asset.
+ */
+function approvalThresholdFor(assetKey: string): string | undefined {
+  return config.APPROVAL_THRESHOLDS_MAP.get(assetKey) ?? config.APPROVAL_THRESHOLD;
+}
+
+/** Which spend, if any, of `task` exceeds its applicable approval threshold. */
+interface ExceededApprovalThreshold {
+  assetKey: string;
+  amount: string;
+  threshold: string;
+}
+
+/**
+ * Finds the first spend of `task` that exceeds its applicable approval
+ * threshold (#953), comparing in exact BigInt stroops per asset — never with
+ * a float parse, and never pooling two different assets' amounts into one
+ * global number the way the old `taskAmount()`-based check did.
+ *
+ * Task types `taskSpends()` doesn't itemize by asset (i.e. it returns no
+ * entries for them) fall back to comparing `taskAmount()` against the global
+ * APPROVAL_THRESHOLD only, preserving their previous (asset-blind) coverage.
+ */
+function findExceededApprovalThreshold(task: AgentTask): ExceededApprovalThreshold | null {
+  const spends = taskSpends(task);
+  if (spends.length > 0) {
+    for (const spend of spends) {
+      const threshold = approvalThresholdFor(spend.assetKey);
+      if (threshold === undefined) continue;
+      const stroops = tryToStroops(spend.amount);
+      if (stroops !== null && stroops > toStroops(threshold)) {
+        return { assetKey: spend.assetKey, amount: spend.amount, threshold };
+      }
+    }
+    return null;
+  }
+
+  const amount = taskAmount(task);
+  const threshold = config.APPROVAL_THRESHOLD;
+  if (amount === null || threshold === undefined) return null;
+  const stroops = tryToStroops(amount);
+  if (stroops !== null && stroops > toStroops(threshold)) {
+    // This task type isn't itemized by taskSpends(), so there's no specific
+    // asset to name — the comparison above is already asset-blind for it.
+    return { assetKey: '(unspecified asset)', amount, threshold };
+  }
+  return null;
 }
 
 // ─── Task types ───────────────────────────────────────────────────────────────
@@ -1197,6 +1253,7 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
    */
   private holdForApproval(task: AgentTask, correlationId: string): AgentResult | null {
     let amount = taskAmount(task);
+    let exceeded: ExceededApprovalThreshold | null = null;
     if (task.requireApproval) {
       amount = amount ?? '0';
     } else {
@@ -1244,7 +1301,7 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
       },
       error: task.requireApproval
         ? `${task.type} requires human approval — awaiting approval`
-        : `Amount ${amount} exceeds APPROVAL_THRESHOLD of ${config.APPROVAL_THRESHOLD} — awaiting approval`,
+        : `Amount ${exceeded!.amount} (${exceeded!.assetKey}) exceeds its approval threshold of ${exceeded!.threshold} — awaiting approval`,
       errorType: ErrorType.PendingApproval,
       correlationId,
     };
@@ -1282,26 +1339,68 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
     }
   }
 
-  /** Approvals still waiting for a decision. */
-  listApprovals(): PendingApproval[] {
+  /** Approvals still waiting for a decision, each with its approve votes so far (#954). */
+  listApprovals(): Array<PendingApproval & { votes: string[] }> {
     this.expireApprovals();
-    return listPendingApprovals();
+    return listPendingApprovals().map((approval) => ({
+      ...approval,
+      votes: getApprovalVotes(approval.id),
+    }));
   }
 
   /**
-   * Approve a pending task and execute it. Only the call that moves the
-   * approval out of `pending_approval` executes the task, so approving twice
-   * runs it once; later calls just return the approval's current state.
+   * True when `approval`'s amount requires APPROVAL_MIN_APPROVERS distinct
+   * approvers before it executes (#954), rather than just one.
+   */
+  private needsMultipleApprovers(approval: PendingApproval): boolean {
+    const threshold = config.APPROVAL_MULTI_APPROVER_THRESHOLD;
+    if (threshold === undefined) return false;
+    const stroops = tryToStroops(approval.amount);
+    return stroops !== null && stroops > toStroops(threshold);
+  }
+
+  /**
+   * Approve a pending task and execute it (#954: attributed to `approver`,
+   * "admin" when omitted — the shared ADMIN_API_TOKEN). Only the call that
+   * moves the approval out of `pending_approval` executes the task, so
+   * approving twice runs it once; later calls just return the current state.
+   *
+   * Above APPROVAL_MULTI_APPROVER_THRESHOLD, this records `approver`'s vote
+   * instead of deciding immediately, and only executes once
+   * APPROVAL_MIN_APPROVERS distinct approvers have voted; `votes` on the
+   * returned approval shows who has voted so far.
    *
    * @returns null when no approval has this id.
    */
-  async approve(id: string): Promise<{ approval: PendingApproval; result?: AgentResult } | null> {
+  async approve(
+    id: string,
+    approver: string | null = null
+  ): Promise<{ approval: PendingApproval & { votes?: string[] }; result?: AgentResult } | null> {
     this.expireApprovals();
     const approval = getPendingApproval(id);
     if (!approval) return null;
-    if (!decideApproval(id, 'approved')) return { approval };
+    const decidedBy = approver ?? 'admin';
 
-    log.warn({ approvalId: id, taskType: approval.taskType }, 'Pending approval approved');
+    if (this.needsMultipleApprovers(approval)) {
+      const voteCount = recordApprovalVote(id, decidedBy);
+      const votes = getApprovalVotes(id);
+      if (voteCount < config.APPROVAL_MIN_APPROVERS) {
+        log.warn(
+          { approvalId: id, votes, required: config.APPROVAL_MIN_APPROVERS },
+          'Approval vote recorded; awaiting more approvers'
+        );
+        return { approval: { ...(getPendingApproval(id) ?? approval), votes } };
+      }
+    }
+
+    if (!decideApproval(id, 'approved', Date.now(), decidedBy)) {
+      return { approval: getPendingApproval(id) ?? approval };
+    }
+
+    log.warn(
+      { approvalId: id, taskType: approval.taskType, decidedBy },
+      'Pending approval approved'
+    );
     // The task reserves its own amount when it runs.
     this.releaseApprovalReservation(id);
     const task: AgentTask = {
@@ -1315,16 +1414,19 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
   }
 
   /**
-   * Deny a pending task and release its spending reservation.
+   * Deny a pending task and release its spending reservation (#954:
+   * attributed to `approver`, "admin" when omitted). Any single approver may
+   * deny regardless of APPROVAL_MIN_APPROVERS — consensus is required only
+   * to move money, not to block it.
    *
    * @returns null when no approval has this id.
    */
-  deny(id: string): PendingApproval | null {
+  deny(id: string, approver: string | null = null): PendingApproval | null {
     this.expireApprovals();
     if (!getPendingApproval(id)) return null;
-    if (decideApproval(id, 'denied')) {
+    if (decideApproval(id, 'denied', Date.now(), approver ?? 'admin')) {
       this.releaseApprovalReservation(id);
-      log.warn({ approvalId: id }, 'Pending approval denied');
+      log.warn({ approvalId: id, deniedBy: approver ?? 'admin' }, 'Pending approval denied');
     }
     return getPendingApproval(id) ?? null;
   }

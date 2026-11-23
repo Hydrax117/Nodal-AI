@@ -205,7 +205,8 @@ export const EnvSchema = z.object({
 
   // Human-in-the-loop approval: value-moving tasks above this amount are held
   // as pending_approval until approved or denied via POST /approvals/:id.
-  // Unset = no approval step.
+  // Unset = no approval step. Acts as the fallback for any asset not listed
+  // in APPROVAL_THRESHOLDS (#953).
   APPROVAL_THRESHOLD: z
     .string()
     .regex(
@@ -213,6 +214,44 @@ export const EnvSchema = z.object({
       "APPROVAL_THRESHOLD must be a positive decimal (e.g. '500' or '50.0000000')"
     )
     .optional(),
+  /**
+   * Per-asset approval thresholds (#953), so e.g. 100 XLM and 100 of a
+   * high-value asset aren't held to the same bar. Same shape as
+   * SPENDING_LIMITS: comma-separated 'CODE:LIMIT' (XLM/native) or
+   * 'CODE:ISSUER:LIMIT' (credit assets), e.g. 'XLM:5000,USDC:GA5Z…:500'.
+   * An asset not listed here falls back to APPROVAL_THRESHOLD.
+   */
+  APPROVAL_THRESHOLDS: z
+    .string()
+    .optional()
+    .refine(
+      (val) => {
+        if (!val) return true;
+        const limitRe = /^[1-9]\d*(\.\d{1,7})?$/;
+        const g56Re = /^G[A-Z2-7]{55}$/;
+        for (const entry of val.split(',')) {
+          const parts = entry.trim().split(':');
+          if (parts.length === 2) {
+            const [, limit] = parts as [string, string];
+            if (!limitRe.test(limit)) return false;
+          } else if (parts.length === 3) {
+            const [, issuer, limit] = parts as [string, string, string];
+            if (!g56Re.test(issuer)) return false;
+            if (!limitRe.test(limit)) return false;
+          } else {
+            return false;
+          }
+        }
+        return true;
+      },
+      {
+        message:
+          'APPROVAL_THRESHOLDS must be a comma-separated list of ' +
+          "'ASSET_CODE:THRESHOLD' (for XLM/native) or " +
+          "'ASSET_CODE:ISSUER:THRESHOLD' (for credit assets), " +
+          "e.g. 'XLM:5000,USDC:GA5Z…:500'",
+      }
+    ),
   // How long a pending approval waits for a decision before it expires.
   APPROVAL_TTL_MS: z.coerce.number().int().min(1_000).default(3_600_000),
 
@@ -463,6 +502,10 @@ export const EnvSchema = z.object({
     .enum(['true', 'false'])
     .default('false')
     .transform((v) => v === 'true'),
+  // How often each instance re-reads the paused state from the shared storage
+  // backend (#960), so a pause/resume on one instance reaches the others
+  // within this bound. Only matters with multiple instances sharing one store.
+  KILL_SWITCH_SYNC_INTERVAL_MS: z.coerce.number().int().min(100).default(2_000),
 
   // Backward-compat: sign the body only (no timestamp). Deprecated — removed next release.
   WEBHOOK_LEGACY_SIGNATURE: z
@@ -612,8 +655,16 @@ export interface AgentConfig {
   /**
    * Amount above which a value-moving task is held as `pending_approval` until
    * an operator approves or denies it. Optional — when unset no task is held.
+   * Used as the fallback for any asset not listed in APPROVAL_THRESHOLDS_MAP.
    */
   readonly APPROVAL_THRESHOLD?: string | undefined;
+
+  /**
+   * Parsed form of APPROVAL_THRESHOLDS (#953): asset key ("XLM" or
+   * "CODE:ISSUER", matching backend/spending_tracker.ts's assetKey()) to its
+   * threshold. Empty when APPROVAL_THRESHOLDS is unset.
+   */
+  readonly APPROVAL_THRESHOLDS_MAP: ReadonlyMap<string, string>;
 
   /**
    * How long (ms) a pending approval waits for a decision before it expires and
@@ -932,6 +983,12 @@ export interface AgentConfig {
    * errorType AGENT_PAUSED until resumed via POST /admin/resume. Defaults to false.
    */
   readonly PAUSED: boolean;
+  /**
+   * How often (ms) each instance re-reads the paused state from the shared
+   * storage backend, so a pause/resume on one instance is picked up by every
+   * other instance sharing that store within this bound (#960). Defaults to 2000.
+   */
+  readonly KILL_SWITCH_SYNC_INTERVAL_MS: number;
 
   // ─── LLM Provider Configuration ─────────────────────────────────────────
 
@@ -1112,6 +1169,30 @@ function parseConfigAndDerive(
     }
   }
 
+  // ── Parse per-asset approval thresholds (#953) ─────────────────────────────
+  const approvalThresholdsMap = new Map<string, string>();
+  if (raw.APPROVAL_THRESHOLDS) {
+    for (const entry of raw.APPROVAL_THRESHOLDS.split(',')) {
+      const parts = entry.trim().split(':');
+      if (parts.length === 2) {
+        const [code, threshold] = parts as [string, string];
+        approvalThresholdsMap.set(code.toUpperCase(), threshold);
+      } else if (parts.length === 3) {
+        const [code, issuer, threshold] = parts as [string, string, string];
+        approvalThresholdsMap.set(`${code.toUpperCase()}:${issuer}`, threshold);
+      }
+    }
+  }
+
+  // ── Parse named approver tokens (#954) ─────────────────────────────────────
+  const approverTokensMap = new Map<string, string>();
+  if (raw.APPROVER_TOKENS) {
+    for (const entry of raw.APPROVER_TOKENS.split(',')) {
+      const [name, hash] = entry.trim().split(':') as [string, string];
+      approverTokensMap.set(name, hash.toLowerCase());
+    }
+  }
+
   // ── HTTP API auth guard ────────────────────────────────────────────────────
   // /status and /spending expose payment history and spending data. Without a
   // token the server would serve them to anyone, so mainnet refuses to start;
@@ -1211,6 +1292,8 @@ function parseConfigAndDerive(
     ALLOWED_X402_ORIGINS,
     AGENT_SECRET_KEY_ARN,
     SPENDING_LIMITS: _rawLimits,
+    APPROVAL_THRESHOLDS: _rawApprovalThresholds,
+    APPROVER_TOKENS: _rawApproverTokens,
     OTLP_ENDPOINT,
     WEBHOOK_URL,
     WEBHOOK_SECRET,
@@ -1252,6 +1335,8 @@ function parseConfigAndDerive(
     ...(WEBHOOK_URL && { WEBHOOK_URL }),
     ...(WEBHOOK_SECRET && { WEBHOOK_SECRET }),
     SPENDING_LIMITS_MAP: spendingLimitsMap,
+    APPROVAL_THRESHOLDS_MAP: approvalThresholdsMap,
+    APPROVER_TOKENS_MAP: approverTokensMap,
     SPENDING_LIMITS_ALLOW_UNKNOWN: raw.SPENDING_LIMITS_ALLOW_UNKNOWN,
     PAYMENT_DESTINATIONS: paymentDestinations,
     X402_ASSET_CONTRACT: x402AssetContract,

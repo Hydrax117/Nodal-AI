@@ -16,7 +16,7 @@
  *     the response shapes.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ── Mock modules before importing the module under test ──────────────────────
 
@@ -42,6 +42,8 @@ vi.mock('../backend/config', () => ({
     // time; without these the URI constructor throws and the suite cannot load.
     HORIZON_URL: 'https://horizon-testnet.stellar.org',
     SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org',
+    APPROVER_TOKENS_MAP: new Map<string, string>(),
+    APPROVAL_MIN_APPROVERS: 2,
   },
   getAdminApiToken: () => process.env.ADMIN_API_TOKEN || process.env.WEBHOOK_SECRET || undefined,
 }));
@@ -98,6 +100,8 @@ vi.mock('../backend/kill_switch', () => ({
 
 import type * as http from 'http';
 import { Readable } from 'stream';
+import { createHash } from 'crypto';
+import { config } from '../backend/config';
 import { createHealthServer } from '../backend/server';
 import { pauseAgent, resumeAgent } from '../backend/kill_switch';
 import {
@@ -542,7 +546,7 @@ describe('backend/server.ts — health check HTTP server', () => {
       await flush();
 
       expect(res._statusCode).toBe(200);
-      expect(agent.approve).toHaveBeenCalledWith('appr-1');
+      expect(agent.approve).toHaveBeenCalledWith('appr-1', null);
       expect(JSON.parse(res._body).approval.status).toBe('approved');
     });
 
@@ -565,7 +569,7 @@ describe('backend/server.ts — health check HTTP server', () => {
       await flush();
 
       expect(res._statusCode).toBe(200);
-      expect(agent.deny).toHaveBeenCalledWith('appr-1');
+      expect(agent.deny).toHaveBeenCalledWith('appr-1', null);
       expect(JSON.parse(res._body).approval.status).toBe('denied');
     });
 
@@ -583,6 +587,107 @@ describe('backend/server.ts — health check HTTP server', () => {
 
       expect(bad._statusCode).toBe(400);
       expect(missing._statusCode).toBe(404);
+    });
+  });
+
+  describe('approvals — named approver tokens (#954)', () => {
+    const approval = { id: 'appr-1', status: 'pending_approval' };
+    let agent: any;
+    const ALICE_TOKEN = 'alice-secret-token';
+    const aliceHash = createHash('sha256').update(ALICE_TOKEN).digest('hex');
+
+    beforeEach(() => {
+      agent = {
+        approve: vi.fn(async () => ({
+          approval: { ...approval, status: 'approved', decidedBy: 'alice' },
+        })),
+        deny: vi.fn(() => ({ ...approval, status: 'denied', decidedBy: 'alice' })),
+      };
+      process.env.WEBHOOK_SECRET = 'admin-secret';
+      (config as any).APPROVER_TOKENS_MAP = new Map([['alice', aliceHash]]);
+    });
+
+    afterEach(() => {
+      (config as any).APPROVER_TOKENS_MAP = new Map();
+      delete process.env.WEBHOOK_SECRET;
+    });
+
+    it('identifies a named approver by their own token and passes it through', async () => {
+      createHealthServer(agent);
+      const res = makeRes();
+
+      capturedHandler!(
+        makeBodyReq(
+          'POST',
+          '/approvals/appr-1',
+          { decision: 'approve' },
+          { authorization: `Bearer ${ALICE_TOKEN}` }
+        ),
+        res
+      );
+      await flush();
+
+      expect(res._statusCode).toBe(200);
+      expect(agent.approve).toHaveBeenCalledWith('appr-1', 'alice');
+      expect(JSON.parse(res._body).approval.decidedBy).toBe('alice');
+    });
+
+    it('a named approver token works without the shared admin token', async () => {
+      // No "Bearer admin-secret" anywhere — alice's own credential is enough.
+      createHealthServer(agent);
+      const res = makeRes();
+
+      capturedHandler!(
+        makeBodyReq(
+          'POST',
+          '/approvals/appr-1',
+          { decision: 'deny' },
+          { authorization: `Bearer ${ALICE_TOKEN}` }
+        ),
+        res
+      );
+      await flush();
+
+      expect(res._statusCode).toBe(200);
+      expect(agent.deny).toHaveBeenCalledWith('appr-1', 'alice');
+    });
+
+    it('falls back to null (recorded as "admin") for the shared admin token', async () => {
+      createHealthServer(agent);
+      const res = makeRes();
+
+      capturedHandler!(
+        makeBodyReq(
+          'POST',
+          '/approvals/appr-1',
+          { decision: 'approve' },
+          { authorization: 'Bearer admin-secret' }
+        ),
+        res
+      );
+      await flush();
+
+      expect(res._statusCode).toBe(200);
+      expect(agent.approve).toHaveBeenCalledWith('appr-1', null);
+    });
+
+    it('rejects a token that matches no approver and is not the admin token', async () => {
+      createHealthServer(agent);
+      const res = makeRes();
+
+      capturedHandler!(
+        makeBodyReq(
+          'POST',
+          '/approvals/appr-1',
+          { decision: 'approve' },
+          { authorization: 'Bearer someone-elses-token' }
+        ),
+        res
+      );
+      await flush();
+
+      expect(res._statusCode).toBe(401);
+      expect(agent.approve).not.toHaveBeenCalled();
     });
   });
 

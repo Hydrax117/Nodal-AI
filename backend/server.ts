@@ -157,6 +157,44 @@ function tokensMatch(given: string, expected: string): boolean {
 }
 
 /**
+ * Constant-time comparison of two hex-digest strings, tolerating a mismatched
+ * length (a misconfigured or truncated hash) instead of throwing.
+ */
+function hashesMatch(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'hex');
+  const bufB = Buffer.from(b, 'hex');
+  return bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Identifies the named approver (#954) presenting a bearer token matching one
+ * of APPROVER_TOKENS. Returns null when the token matches no configured
+ * approver — including when APPROVER_TOKENS is unset.
+ */
+function identifyApprover(req: http.IncomingMessage): string | null {
+  const auth = req.headers['authorization'];
+  if (!auth) return null;
+  const [scheme, token] = auth.split(' ');
+  if (scheme?.toLowerCase() !== 'bearer' || !token) return null;
+
+  const hash = createHash('sha256').update(token).digest('hex');
+  for (const [name, expectedHash] of config.APPROVER_TOKENS_MAP) {
+    if (hashesMatch(hash, expectedHash)) return name;
+  }
+  return null;
+}
+
+/**
+ * True when the request may decide a pending approval (#954): either the
+ * shared ADMIN_API_TOKEN/WEBHOOK_SECRET, or one of the named APPROVER_TOKENS
+ * — so a named approver's credential doesn't have to also be able to submit
+ * tasks, enabling separation of duties.
+ */
+function isApproverAuthenticated(req: http.IncomingMessage): boolean {
+  return isAuthenticated(req) || identifyApprover(req) !== null;
+}
+
+/**
  * Returns true if the request passes Bearer-token authentication.
  * When no API token is configured, requests are allowed on testnet/futurenet
  * only; on mainnet they are always rejected.
@@ -664,7 +702,7 @@ async function handleApprovalDecision(
     res.end(body);
   };
 
-  if (!apiToken() || !isAuthenticated(req)) {
+  if (!apiToken() || !isApproverAuthenticated(req)) {
     send(401, { error: 'Unauthorized' });
     return;
   }
@@ -685,13 +723,16 @@ async function handleApprovalDecision(
     return;
   }
 
+  // Named approver (#954), falling back to "admin" for the shared token.
+  const approver = identifyApprover(req);
+
   try {
     if (decision === 'approve') {
-      const outcome = await agent.approve(id);
+      const outcome = await agent.approve(id, approver);
       if (!outcome) send(404, { error: 'Approval not found' });
       else send(200, outcome);
     } else {
-      const approval = agent.deny(id);
+      const approval = agent.deny(id, approver);
       if (!approval) send(404, { error: 'Approval not found' });
       else send(200, { approval });
     }

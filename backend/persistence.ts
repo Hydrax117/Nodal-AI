@@ -224,6 +224,9 @@ export interface PendingApproval {
   createdAt: number;
   expiresAt: number;
   decidedAt: number | null;
+  /** Name of the approver who made the final decision (#954), or "admin" when
+   * decided with the shared ADMIN_API_TOKEN. Null until decided. */
+  decidedBy: string | null;
 }
 
 export interface ApprovalAuditRow {
@@ -247,7 +250,8 @@ export function listPendingApprovals(): PendingApproval[] {
 export function decideApproval(
   id: string,
   decision: 'approved' | 'denied',
-  now: number = Date.now()
+  now: number = Date.now(),
+  decidedBy: string | null = null
 ): boolean {
   return sqlite.decideApproval(id, decision, now);
 }
