@@ -26,3 +26,5 @@ Thumbs.db
 .coverage
 coverage/
 
+# Local session notes (not committed)
+SESSION_CHANGES.md

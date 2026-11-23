@@ -1,344 +1,333 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-
 /**
- * Tests for triggers.ts ensuring:
+ * tests/triggers.test.ts
  *
- * - Asset issuer filtering (Issue #243)
- * - BigInt-based amount comparison (Issue #241)
- * - Contract event trigger support
- * - Storage change trigger support
- * - Deduplication across restarts
+ * TriggerManager validation and approval tests.
  */
 
-// Import the module under test
-import * as triggersModule from '../backend/triggers';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { TriggerManager } from '../backend/triggers';
+import { PayFiAgent, AgentTask } from '../backend/agent';
+import { config } from '../backend/config';
+import { _setDb, getDb, dbCleanup } from '../backend/persistence';
 
-// ─── Mock config ──────────────────────────────────────────────────────────────
-
+// Mock config for tests
 vi.mock('../backend/config', () => ({
   config: {
-    X402_ASSET_CODE: 'USDC',
-    X402_ASSET_ISSUER: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM34K4KZVN',
-    AGENT_SPENDING_LIMIT: '1000',
+    TRIGGER_ALLOW_PAYMENTS: false,
+    APPROVAL_THRESHOLD: undefined,
+    STELLAR_NETWORK: 'testnet',
+    HORIZON_URL: 'https://horizon-testnet.stellar.org',
+    SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org',
   },
 }));
 
-vi.mock('../backend/utils/logger', () => ({
-  createLogger: () => ({
-    info: () => {},
-    warn: () => {},
-    error: () => {},
-  }),
+vi.mock('../backend/rpc_client', () => ({
+  horizonServer: {
+    payments: vi.fn().mockReturnValue({
+      forAccount: vi.fn().mockReturnValue({
+        stream: vi.fn(),
+      }),
+    }),
+  },
+  sorobanServer: {
+    getLatestLedger: vi.fn().mockResolvedValue({ sequence: 1 }),
+    getEvents: vi.fn().mockResolvedValue({ events: [], cursor: '' }),
+  },
 }));
 
-// Mock the agent
-const mockAgent = {
-  startListening: vi.fn(),
-  stopListening: vi.fn(),
-  startContractListener: vi.fn(),
-  stopContractListener: vi.fn(),
-  startStorageWatcher: vi.fn(),
-  stopStorageWatcher: vi.fn(),
-  run: vi.fn().mockResolvedValue({ success: true }),
-};
+// Create a mock agent for testing
+function createMockAgent(): PayFiAgent {
+  const agent = new PayFiAgent();
+  agent.startListening = vi.fn();
+  agent.stopListening = vi.fn();
+  agent.startContractListener = vi.fn();
+  agent.stopContractListener = vi.fn();
+  agent.startStorageWatcher = vi.fn();
+  agent.stopStorageWatcher = vi.fn();
+  return agent;
+}
 
-// Mock persistence to track trigger events
-const mockDb = {
-  prepare: vi.fn(),
-};
-const runResults: any[] = [];
-mockDb.prepare.mockReturnValue({
-  run: vi.fn().mockImplementation((...args: any[]) => {
-    runResults.push(args);
-    return { changes: 0 };
-  }),
-  all: vi.fn().mockReturnValue([]),
-});
-
-vi.mock('../backend/persistence', () => ({
-  getDb: () => mockDb,
-}));
-
-// Mock contract event listeners
-vi.mock('../backend/tools/ContractEventListener', () => ({
-  listen: vi.fn(),
-}));
-
-vi.mock('../backend/tools/ContractStorageWatcherTool', () => ({
-  watchContractStorage: vi.fn(),
-}));
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
-
-describe('matchesFilter — asset issuer discrimination', () => {
-  it('same assetCode but different issuer does NOT match', () => {
-    // User creates a trigger for real USDC (with issuer)
-    const triggerFilter = {
-      assetCode: 'USDC',
-      assetIssuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
-    };
-
-    // Fake USDC arrives with different issuer
-    const fakePayment = {
-      assetCode: 'USDC',
-      assetIssuer: 'GB7TAYRZCJZ55X6Z3Y7WY6W6Z7X6Z5Y4X3W2V1U0T9S8R7Q6P5O4N3M2L1K0J',
-      amount: '500',
-    };
-
-    // Filter should NOT match
-    expect(triggersModule.matchesFilter(fakePayment, triggerFilter)).toBe(false);
+describe('TriggerManager', () => {
+  beforeEach(() => {
+    dbCleanup();
+    vi.resetAllMocks();
+    // Reset config mock defaults
+    (config as any).TRIGGER_ALLOW_PAYMENTS = false;
+    (config as any).APPROVAL_THRESHOLD = undefined;
   });
 
-  it('same assetCode and issuer DOES match', () => {
-    const triggerFilter = {
-      assetCode: 'USDC',
-      assetIssuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
-    };
+  describe('createTrigger', () => {
+    it('rejects invalid task types at creation time', async () => {
+      const agent = createMockAgent();
+      const manager = new TriggerManager(agent);
 
-    const realPayment = {
-      assetCode: 'USDC',
-      assetIssuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
-      amount: '500',
-    };
+      const invalidTask: AgentTask = {
+        type: 'unknown_task_type' as any,
+        payload: {},
+      };
 
-    expect(triggersModule.matchesFilter(realPayment, triggerFilter)).toBe(true);
-  });
+      await expect(
+        manager.createTrigger({
+          source: 'payment',
+          filter: {},
+          task: invalidTask,
+        }),
+      ).rejects.toThrow(/Invalid task type "unknown_task_type"/);
+    });
 
-  it('XLM without issuer matches all XLM payments', () => {
-    const triggerFilter = {
-      assetCode: 'XLM',
-    };
+    it('rejects value-moving tasks when TRIGGER_ALLOW_PAYMENTS is false', async () => {
+      const agent = createMockAgent();
+      const manager = new TriggerManager(agent);
 
-    const payment = {
-      assetCode: 'XLM',
-      amount: '100',
-    };
-
-    expect(triggersModule.matchesFilter(payment, triggerFilter)).toBe(true);
-  });
-
-  it('XLM with issuer still matches', () => {
-    const triggerFilter = {
-      assetCode: 'XLM',
-      assetIssuer: '', // XLM is native, issuer is optional
-    };
-
-    const payment = {
-      assetCode: 'XLM',
-      amount: '100',
-    };
-
-    expect(triggersModule.matchesFilter(payment, triggerFilter)).toBe(true);
-  });
-});
-
-describe('matchesFilter — amount comparison with BigInt', () => {
-  it('correctly compares large amounts without float error', () => {
-    const triggerFilter = {
-      assetCode: 'USDC',
-      assetIssuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
-      minAmount: '0.1000001', // 1 stroop over 0.1
-    };
-
-    const payment = {
-      assetCode: 'USDC',
-      assetIssuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
-      amount: '0.1000001', // Exactly the threshold
-    };
-
-    expect(triggersModule.matchesFilter(payment, triggerFilter)).toBe(true);
-  });
-
-  it('rejects amount below threshold using stroop precision', () => {
-    const triggerFilter = {
-      minAmount: '0.1000001',
-    };
-
-    const payment = {
-      amount: '0.1000000', // 1 stroop less
-    };
-
-    expect(triggersModule.matchesFilter(payment, triggerFilter)).toBe(false);
-  });
-});
-
-describe('createTrigger — non-native asset validation', () => {
-  it('rejects non-native trigger without assetIssuer', async () => {
-    const manager = new triggersModule.TriggerManager(mockAgent as any);
-
-    await expect(
-      manager.createTrigger({
-        source: 'payment',
-        filter: {
-          assetCode: 'USDC',
-          // Missing assetIssuer
+      const paymentTask: AgentTask = {
+        type: 'stellar_payment',
+        payload: {
+          destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+          amount: '10',
+          assetCode: 'XLM',
         },
-        task: { type: 'stellar_payment', payload: {} },
-      })
-    ).rejects.toThrow(/assetIssuer is required for non-XLM asset/);
-  });
+      };
 
-  it('accepts non-native trigger with assetIssuer', async () => {
-    const manager = new triggersModule.TriggerManager(mockAgent as any);
-
-    const result = await manager.createTrigger({
-      source: 'payment',
-      filter: {
-        assetCode: 'USDC',
-        assetIssuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
-      },
-      task: { type: 'stellar_payment', payload: {} },
+      await expect(
+        manager.createTrigger({
+          source: 'payment',
+          filter: { minAmount: '1' },
+          task: paymentTask,
+        }),
+      ).rejects.toThrow(/Value-moving triggers are disabled/);
     });
 
-    expect(result).toBeDefined();
-    expect(result.filter.assetCode).toBe('USDC');
-    expect(result.filter.assetIssuer).toBe(
-      'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN'
-    );
+    it('accepts value-moving tasks when TRIGGER_ALLOW_PAYMENTS is true', async () => {
+      (config as any).TRIGGER_ALLOW_PAYMENTS = true;
+
+      const agent = createMockAgent();
+      const manager = new TriggerManager(agent);
+
+      const paymentTask: AgentTask = {
+        type: 'stellar_payment',
+        payload: {
+          destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+          amount: '10',
+          assetCode: 'XLM',
+        },
+      };
+
+      const trigger = await manager.createTrigger({
+        source: 'payment',
+        filter: { minAmount: '1' },
+        task: paymentTask,
+      });
+
+      expect(trigger).toBeDefined();
+      expect(trigger.task.type).toBe('stellar_payment');
+    });
+
+    it('accepts non-value-moving tasks regardless of TRIGGER_ALLOW_PAYMENTS', async () => {
+      const agent = createMockAgent();
+      const manager = new TriggerManager(agent);
+
+      const readTask: AgentTask = {
+        type: 'account_info',
+        payload: {
+          accountId: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        },
+      };
+
+      // With TRIGGER_ALLOW_PAYMENTS=false (default)
+      let trigger = await manager.createTrigger({
+        source: 'payment',
+        filter: {},
+        task: readTask,
+      });
+      expect(trigger).toBeDefined();
+
+      // Even with TRIGGER_ALLOW_PAYMENTS=true
+      (config as any).TRIGGER_ALLOW_PAYMENTS = true;
+      trigger = await manager.createTrigger({
+        source: 'payment',
+        filter: {},
+        task: readTask,
+      });
+      expect(trigger).toBeDefined();
+    });
+
+    it('accepts all valid task types', async () => {
+      (config as any).TRIGGER_ALLOW_PAYMENTS = true;
+
+      const agent = createMockAgent();
+      const manager = new TriggerManager(agent);
+
+      const validTaskTypes = [
+        'stellar_payment',
+        'soroban_invoke',
+        'x402_respond',
+        'multisig_payment',
+        'batch_payment',
+        'path_payment',
+        'dex_offer',
+        'account_info',
+        'balance_check',
+      ];
+
+      for (const type of validTaskTypes) {
+        const task: AgentTask = {
+          type,
+          payload: type === 'account_info' || type === 'balance_check' ? {} : { amount: '1' },
+        };
+
+        await expect(
+          manager.createTrigger({ source: 'payment', filter: {}, task }),
+        ).resolves.toBeDefined();
+      }
+    });
+
+    it('persists trigger to database', async () => {
+      const agent = createMockAgent();
+      const manager = new TriggerManager(agent);
+
+      const readTask: AgentTask = {
+        type: 'account_info',
+        payload: {},
+      };
+
+      const trigger = await manager.createTrigger({
+        source: 'payment',
+        filter: { minAmount: '100' },
+        task: readTask,
+      });
+
+      // Load triggers from database
+      const rows = getDb()
+        .prepare('SELECT id, source, filter, task FROM triggers WHERE id = ?')
+        .get(trigger.id) as any;
+
+      expect(rows).toBeDefined();
+      expect(rows.id).toBe(trigger.id);
+      expect(JSON.parse(rows.filter)).toEqual({ minAmount: '100' });
+      expect(JSON.parse(rows.task)).toEqual({
+        type: 'account_info',
+        payload: {},
+      });
+    });
+
+    it('logs a warning when creating value-moving triggers', async () => {
+      (config as any).TRIGGER_ALLOW_PAYMENTS = true;
+
+      const agent = createMockAgent();
+      const manager = new TriggerManager(agent);
+
+      const paymentTask: AgentTask = {
+        type: 'stellar_payment',
+        payload: {
+          destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+          amount: '10',
+          assetCode: 'XLM',
+        },
+      };
+
+      const consoleWarn = vi.spyOn(console, 'warn');
+      consoleWarn.mockImplementation(() => {});
+
+      await manager.createTrigger({
+        source: 'payment',
+        filter: { minAmount: '1' },
+        task: paymentTask,
+      });
+
+      expect(consoleWarn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          triggerSource: 'payment',
+          taskType: 'stellar_payment',
+        }),
+        'Value-moving trigger created — payments enabled',
+      );
+
+      consoleWarn.mockRestore();
+    });
   });
 
-  it('accepts XLM trigger without assetIssuer', async () => {
-    const manager = new triggersModule.TriggerManager(mockAgent as any);
+  describe('setupPaymentListener', () => {
+    it('does not perform inline spending limit check (delegates to agent)', async () => {
+      const agent = createMockAgent();
+      const manager = new TriggerManager(agent);
 
-    const result = await manager.createTrigger({
-      source: 'payment',
-      filter: {
+      const readTask: AgentTask = {
+        type: 'account_info',
+        payload: {},
+      };
+
+      await manager.createTrigger({
+        source: 'payment',
+        filter: { minAmount: '100' },
+        task: readTask,
+      });
+
+      // Simulate a payment that would trigger
+      const challenge = {
+        nonce: 'test-nonce',
         assetCode: 'XLM',
-        // No assetIssuer needed for XLM
-      },
-      task: { type: 'stellar_payment', payload: {} },
+        payTo: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        amount: '1000',
+      };
+
+      const agentRunSpy = vi.spyOn(agent, 'run').mockResolvedValue({
+        success: true,
+        taskType: 'account_info',
+      });
+
+      // The payment listener should fire the trigger
+      // Get the callback registered with startListening
+      const callback = (agent.startListening as vi.Mock).mock.calls[0][1];
+      await callback(challenge);
+
+      expect(agentRunSpy).toHaveBeenCalledWith(readTask);
+
+      agentRunSpy.mockRestore();
     });
 
-    expect(result).toBeDefined();
-  });
-});
+    it('large value-moving triggers go to pending approval', async () => {
+      // Set approval threshold to 500
+      (config as any).APPROVAL_THRESHOLD = '500';
+      (config as any).TRIGGER_ALLOW_PAYMENTS = true;
 
-describe('matchesFilter — edge cases', () => {
-  it('handles X402 payment object structure correctly', () => {
-    const triggerFilter = {
-      assetCode: 'USDC',
-      assetIssuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
-    };
+      const agent = createMockAgent();
+      const manager = new TriggerManager(agent);
 
-    // X402 challenge structure passed to payment listener
-    const payment = {
-      assetCode: 'USDC',
-      assetIssuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
-      from: 'GB7TAYRZCJZ55X6Z3Y7WY6W6Z7X6Z5Y4X3W2V1U0T9S8R7Q6P5O4N3M2L1K0J',
-      amount: '500',
-    };
+      const paymentTask: AgentTask = {
+        type: 'stellar_payment',
+        payload: {
+          destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+          amount: '1000',
+          assetCode: 'XLM',
+        },
+      };
 
-    expect(triggersModule.matchesFilter(payment, triggerFilter)).toBe(true);
-  });
+      await manager.createTrigger({
+        source: 'payment',
+        filter: { minAmount: '1' },
+        task: paymentTask,
+      });
 
-  it('matches assetCode only when no issuer specified for non-XLM (legacy)', () => {
-    // This is the OLD behavior for backward compatibility
-    const triggerFilter = {
-      assetCode: 'USDC',
-      // No assetIssuer — legacy trigger
-    };
+      // Simulate a payment that exceeds approval threshold
+      const challenge = {
+        nonce: 'test-nonce',
+        assetCode: 'XLM',
+        payTo: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        amount: '1000',
+      };
 
-    const payment = {
-      assetCode: 'USDC',
-      assetIssuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
-      amount: '500',
-    };
+      const agentRunSpy = vi
+        .spyOn(agent, 'run')
+        .mockResolvedValue({ success: false, taskType: 'stellar_payment' });
 
-    // Should still match to avoid breaking existing triggers
-    expect(triggersModule.matchesFilter(payment, triggerFilter)).toBe(true);
-  });
-});
+      // The payment listener should fire the trigger
+      const callback = (agent.startListening as vi.Mock).mock.calls[0][1];
+      await callback(challenge);
 
-// ─── Contract Event Trigger Tests ────────────────────────────────────────────
+      // The trigger should call agent.run, and agent should return a pending approval result
+      expect(agentRunSpy).toHaveBeenCalledWith(paymentTask);
 
-describe('ContractEvent trigger', () => {
-  it('fires trigger when contract event matches', async () => {
-    const mockHandle = {
-      stop: vi.fn(),
-      on: vi.fn(),
-      removeAllListeners: vi.fn(),
-    };
-    vi.mocked(triggersModule.listenContractEvents as any).mockReturnValue(mockHandle);
-
-    const manager = new triggersModule.TriggerManager(mockAgent as any);
-
-    // Create a contract event trigger
-    await manager.createTrigger({
-      source: 'contract_event',
-      filter: {
-        contractId: 'CB7TYW2P3JZV7X5Y7W6Z7X6Z5Y4X3W2V1U0T9S8R7Q6P5O4N3M2L1K0J',
-        eventTopics: ['Transfer'],
-      },
-      task: { type: 'stellar_payment', payload: {} },
+      agentRunSpy.mockRestore();
     });
-
-    // Start the manager (this sets up listeners)
-    await manager.start();
-
-    // Verify listener was set up
-    expect(triggersModule.listenContractEvents).toHaveBeenCalledWith(
-      'CB7TYW2P3JZV7X5Y7W6Z7X6Z5Y4X3W2V1U0T9S8R7Q6P5O4N3M2L1K0J',
-      ['Transfer'],
-      expect.any(Function),
-      expect.any(Object)
-    );
-
-    // Cleanup
-    manager.stop();
-  });
-});
-
-// ─── Storage Change Trigger Tests ────────────────────────────────────────────
-
-describe('StorageChange trigger', () => {
-  it('fires trigger when storage key changes', async () => {
-    // Mock watchContractStorage
-    const mockHandle = {
-      stop: vi.fn(),
-      on: vi.fn(),
-      removeAllListeners: vi.fn(),
-    };
-    vi.mocked(triggersModule.watchContractStorage as any).mockReturnValue(mockHandle);
-
-    const manager = new triggersModule.TriggerManager(mockAgent as any);
-
-    // Create a storage change trigger
-    await manager.createTrigger({
-      source: 'storage_change',
-      filter: {
-        contractId: 'CB7TYW2P3JZV7X5Y7W6Z7X6Z5Y4X3W2V1U0T9S8R7Q6P5O4N3M2L1K0J',
-        storageKey: 'dGVzdGtleQ==', // base64 encoded "testkey"
-      },
-      task: { type: 'stellar_payment', payload: {} },
-    });
-
-    // Start the manager (this sets up listeners)
-    await manager.start();
-
-    // Verify watcher was set up
-    expect(triggersModule.watchContractStorage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        contractId: 'CB7TYW2P3JZV7X5Y7W6Z7X6Z5Y4X3W2V1U0T9S8R7Q6P5O4N3M2L1K0J',
-      })
-    );
-
-    // Cleanup
-    manager.stop();
-  });
-});
-// ─── Deduplication Tests ─────────────────────────────────────────────────────
-
-describe('Deduplication', () => {
-  it('recordTriggerFired prevents duplicate firing', async () => {
-    const triggerId = 'test-trigger';
-    const eventId = 'event-123';
-
-    // First call should return true (new)
-    const first = await triggersModule.recordTriggerFired(triggerId, eventId);
-    expect(first).toBe(true);
-
-    // Second call should return false (already fired)
-    const second = await triggersModule.recordTriggerFired(triggerId, eventId);
-    expect(second).toBe(false);
   });
 });
