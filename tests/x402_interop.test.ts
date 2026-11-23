@@ -43,6 +43,7 @@ vi.mock('../backend/config', () => {
     X402_ASSET_CONTRACT: 'CD5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
     AGENT_SPENDING_LIMIT: '100',
     APPROVAL_TTL_MS: 3600000,
+    MPP_SESSION_SWEEP_INTERVAL_MS: 60_000,
     PAYMENT_DESTINATION_POLICY: 'open' as const,
     PAYMENT_DESTINATIONS: [],
     MAX_RETRIES: 3,
@@ -105,6 +106,7 @@ vi.mock('../backend/config', () => {
     SPENDING_LIMITS_MAP: new Map<string, string>(),
     SPENDING_LIMITS_ALLOW_UNKNOWN: false,
     NANO_RPC_URL: 'http://127.0.0.1:7076',
+    NANO_ENABLED: false,
   };
 
   return {

@@ -19,16 +19,18 @@
 import { randomUUID } from 'crypto';
 import { Address, BASE_FEE, Keypair, StrKey, TransactionBuilder, xdr } from '@stellar/stellar-sdk';
 import { z } from 'zod';
-import { config, MAINNET_SPENDING_CAP } from '../config';
-import { AgentPausedError, PolicyViolationError, ValidationError } from '../errors';
+import { config } from '../config';
+import { AgentPausedError, ValidationError } from '../errors';
 import { isPaused } from '../kill_switch';
 import { loadAccount, prepareSorobanTx, resolveNetworkPassphrase } from '../rpc_client';
 import { createAgentSigner, Signer } from '../signer';
-import { spendingTracker } from '../spending_tracker';
+import { assetKeyForPaymentAsset, spendingTracker } from '../spending_tracker';
 import { getStorage } from '../db/storage';
 import { createLogger } from '../utils/logger';
 import { toStroops } from '../utils/amount';
 import { caip2Network } from '../x402/middleware';
+import { emitAlert } from '../alerts';
+import { dispatchWebhook } from '../webhook';
 
 const log = createLogger('mpp-session');
 
@@ -42,7 +44,7 @@ const DECIMALS = 7;
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
-export type ChannelStatus = 'Pending' | 'Active' | 'Closed' | 'Disputed';
+export type ChannelStatus = 'Pending' | 'Active' | 'Closed' | 'Disputed' | 'Expired';
 
 /**
  * Off-chain commitment representing the current state of a payment channel.
@@ -74,6 +76,8 @@ export interface ChannelState {
   openedAt: string; // ISO timestamp
   timeoutAt: string; // ISO timestamp
   closedAt?: string | undefined;
+  /** SpendingTracker reservation holding `totalAmount` against the limit. */
+  reservationId?: string | undefined;
   latestCommitment?: ChannelCommitment | undefined; // JSON-serialized
 }
 
@@ -138,10 +142,11 @@ const ChannelStateSchema = z.object({
   agentBalance: z.string(),
   participantBalance: z.string(),
   nonce: z.number().int().nonnegative(),
-  status: z.enum(['Pending', 'Active', 'Closed', 'Disputed']),
+  status: z.enum(['Pending', 'Active', 'Closed', 'Disputed', 'Expired']),
   openedAt: z.string(),
   timeoutAt: z.string(),
   closedAt: z.string().optional(),
+  reservationId: z.string().optional(),
   latestCommitment: z.any().optional(),
 });
 
@@ -172,23 +177,15 @@ function toBaseUnits(amount: string): string {
 /**
  * The agent's spending policy, as applied to channel operations.
  * Reserves the total amount in the rolling window (committed on close).
+ * Limit enforcement — AGENT_SPENDING_LIMIT, per-asset SPENDING_LIMITS, the
+ * mainnet cap and the window total — lives in {@link SpendingTracker.reserve},
+ * which compares in BigInt stroops rather than floating-point math.
  */
-function reserveChannelSpend(amount: string): string {
+function reserveChannelSpend(amount: string, asset: string): string {
   if (isPaused()) {
     throw new AgentPausedError('Agent is paused; MPP session operations are halted');
   }
-  const parsed = parseFloat(amount);
-  if (parsed > parseFloat(config.AGENT_SPENDING_LIMIT)) {
-    throw new PolicyViolationError(
-      `MPP session total of ${amount} exceeds AGENT_SPENDING_LIMIT of ${config.AGENT_SPENDING_LIMIT}`
-    );
-  }
-  if (config.STELLAR_NETWORK === 'mainnet' && parsed > MAINNET_SPENDING_CAP) {
-    throw new PolicyViolationError(
-      `MPP session total of ${amount} exceeds mainnet spending cap of ${MAINNET_SPENDING_CAP}`
-    );
-  }
-  return spendingTracker.reserve(amount);
+  return spendingTracker.reserve(amount, assetKeyForPaymentAsset(asset));
 }
 
 /**
@@ -318,7 +315,7 @@ export class MppSessionClient {
   ): Promise<ChannelState> {
     const agent = this.signer.publicKey();
     const totalDecimal = fromBaseUnits(totalAmount);
-    const reservationId = reserveChannelSpend(totalDecimal);
+    const reservationId = reserveChannelSpend(totalDecimal, asset);
 
     const channelId = randomUUID();
     const now = new Date();
@@ -337,6 +334,7 @@ export class MppSessionClient {
       status: 'Active',
       openedAt,
       timeoutAt,
+      reservationId,
     };
 
     // Create initial commitment
@@ -526,4 +524,117 @@ export class MppSessionClient {
     const state = await loadChannelState(channelId);
     return state?.latestCommitment;
   }
+}
+
+// ─── Expiry sweeper ─────────────────────────────────────────────────────────
+
+/** States the sweeper may expire; terminal states are left alone. */
+const EXPIRABLE_STATUSES: ReadonlySet<ChannelStatus> = new Set(['Pending', 'Active']);
+
+/** Default sweep cadence: once a minute. */
+export const DEFAULT_MPP_SESSION_SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * Mark every channel whose `timeoutAt` has passed as `Expired`, release the
+ * spending reservation held at open, and raise an event plus an operator
+ * alert. Returns the channels this call expired.
+ *
+ * `commitPayment` already refuses payments on timed-out channels; without the
+ * sweeper those channels would sit in `Active` forever, pinning their
+ * reservation against the spending limit.
+ */
+export async function sweepExpiredChannels(now: Date = new Date()): Promise<ChannelState[]> {
+  const records = await getStorage().listMppSessions();
+  const expired: ChannelState[] = [];
+
+  for (const record of records) {
+    let state: ChannelState;
+    try {
+      state = ChannelStateSchema.parse(JSON.parse(record.state));
+    } catch (err) {
+      log.warn(
+        { channelId: record.channelId, error: String(err) },
+        'Skipping malformed MPP session record'
+      );
+      continue;
+    }
+    if (!EXPIRABLE_STATUSES.has(state.status)) continue;
+    if (new Date(state.timeoutAt).getTime() > now.getTime()) continue;
+
+    state.status = 'Expired';
+    state.closedAt = now.toISOString();
+    await saveChannelState(state);
+    expired.push(state);
+
+    releaseChannelReservation(state);
+    notifyChannelExpired(state);
+  }
+
+  if (expired.length > 0) {
+    log.info(
+      { count: expired.length, channelIds: expired.map((s) => s.id) },
+      'Expired MPP channels swept'
+    );
+  }
+  return expired;
+}
+
+/**
+ * Free the reservation `openChannel` took against the spending limit. Best
+ * effort: the reservation may already have aged out of the window, in which
+ * case there is nothing left to release.
+ */
+function releaseChannelReservation(state: ChannelState): void {
+  if (!state.reservationId) return;
+  try {
+    spendingTracker.release(state.reservationId);
+  } catch (err) {
+    log.warn(
+      { channelId: state.id, reservationId: state.reservationId, error: String(err) },
+      'Could not release MPP channel reservation'
+    );
+  }
+}
+
+/** Emit the lifecycle webhook event and the operator alert for an expiry. */
+function notifyChannelExpired(state: ChannelState): void {
+  const timestamp = new Date().toISOString();
+  const details = {
+    channelId: state.id,
+    participant: state.participant,
+    asset: state.asset,
+    totalAmount: state.totalAmount,
+    timeoutAt: state.timeoutAt,
+  };
+  void emitAlert({
+    type: 'channel_expired',
+    severity: 'warning',
+    message: `MPP payment channel expired: ${state.id}`,
+    details,
+    timestamp,
+  });
+  void dispatchWebhook({
+    event: 'mpp.channel_expired',
+    ...details,
+    openedAt: state.openedAt,
+    timestamp,
+  });
+}
+
+/**
+ * Run {@link sweepExpiredChannels} every `intervalMs` until the returned stop
+ * function is called. The timer is unref'd so it never keeps the process alive
+ * on its own.
+ */
+export function startMppSessionSweeper(
+  intervalMs: number = config.MPP_SESSION_SWEEP_INTERVAL_MS ??
+    DEFAULT_MPP_SESSION_SWEEP_INTERVAL_MS
+): () => void {
+  const timer = setInterval(() => {
+    sweepExpiredChannels().catch((err) =>
+      log.error({ error: String(err) }, 'MPP channel sweep failed')
+    );
+  }, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
 }
