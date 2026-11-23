@@ -37,6 +37,7 @@ import { LedgerInfoTool } from '../backend/tools/LedgerInfoTool';
 import { NetworkStatusTool } from '../backend/tools/NetworkStatusTool';
 import { OfferBookTool } from '../backend/tools/OfferBookTool';
 import { SorobanStorageTool } from '../backend/tools/SorobanStorageTool';
+import { ClaimableBalanceTool } from '../backend/tools/ClaimableBalanceTool';
 import { ValidationError, UnauthorizedError, ErrorType } from '../backend/errors';
 import { isPaused } from '../backend/kill_switch';
 import { config } from '../backend/config';
@@ -243,6 +244,15 @@ vi.mock('../backend/tools/OfferBookTool', () => ({
   OfferBookTool: vi.fn().mockImplementation(function () {
     return {
       execute: vi.fn(),
+    };
+  }),
+}));
+
+vi.mock('../backend/tools/ClaimableBalanceTool', () => ({
+  ClaimableBalanceInputSchema: passthroughSchema,
+  ClaimableBalanceTool: vi.fn().mockImplementation(function () {
+    return {
+      execute: vi.fn().mockResolvedValue({ txHash: 'claimable_balance_mock_hash', ledger: 1 }),
     };
   }),
 }));
@@ -808,6 +818,11 @@ describe('PayFiAgent — new task types', () => {
         execute: vi.fn().mockResolvedValue({ txHash: 'dex_mock_hash', ledger: 1, offerId: '0' }),
       } as any;
     });
+    vi.mocked(ClaimableBalanceTool).mockImplementation(function () {
+      return {
+        execute: vi.fn().mockResolvedValue({ txHash: 'claimable_balance_mock_hash', ledger: 1 }),
+      } as any;
+    });
     agent = new PayFiAgent();
   });
 
@@ -857,6 +872,43 @@ describe('PayFiAgent — new task types', () => {
     });
     expect(result.success).toBe(true);
     expect(result.taskType).toBe('dex_offer');
+  });
+
+  it('dispatches claimable_balance (create) and returns success', async () => {
+    const result = await agent.run({
+      type: 'claimable_balance',
+      payload: {
+        action: 'create',
+        assetCode: 'XLM',
+        amount: '10',
+        claimants: [{ destination: DEST }],
+      },
+    });
+    expect(result.success).toBe(true);
+    expect(result.taskType).toBe('claimable_balance');
+  });
+
+  it('dispatches claimable_balance (claim) and returns success', async () => {
+    const result = await agent.run({
+      type: 'claimable_balance',
+      payload: { action: 'claim', balanceId: '000000001234' },
+    });
+    expect(result.success).toBe(true);
+    expect(result.taskType).toBe('claimable_balance');
+  });
+
+  it('applies the spending limit when creating a claimable balance', async () => {
+    const result = await agent.run({
+      type: 'claimable_balance',
+      payload: {
+        action: 'create',
+        assetCode: 'XLM',
+        amount: String(Number(config.AGENT_SPENDING_LIMIT) + 1),
+        claimants: [{ destination: DEST }],
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/exceeds/i);
   });
 
   it('startContractListener starts the listener and stopContractListener stops it', () => {

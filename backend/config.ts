@@ -23,8 +23,31 @@ import * as dotenv from 'dotenv';
 import { Asset, Keypair, Networks } from '@stellar/stellar-sdk';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { isValidStellarContractId, isValidStellarPublicKey } from './utils/stellarSchemas';
+import { toStroops, tryToStroops } from './utils/amount';
 
 export const MAINNET_SPENDING_CAP = 10_000;
+
+/**
+ * Validates a comma-separated asset allowlist: each entry must be "XLM" or
+ * "CODE:ISSUER" (code <= 12 chars, issuer a valid Ed25519 public key).
+ * Shared by X402_ALLOWED_ASSETS and ESCROW_ALLOWED_TOKENS.
+ */
+function isValidAssetAllowlist(val: string): boolean {
+  return val
+    .split(',')
+    .map((entry) => entry.trim())
+    .every((entry) => {
+      if (entry === 'XLM') return true;
+      const [code, issuer, ...extra] = entry.split(':');
+      return (
+        extra.length === 0 &&
+        !!code &&
+        code.length <= 12 &&
+        !!issuer &&
+        isValidStellarPublicKey(issuer)
+      );
+    });
+}
 
 // Load .env file (no-op when running in CI / production with real env vars)
 dotenv.config();
@@ -134,6 +157,12 @@ export const EnvSchema = z.object({
     }),
   // SEP-41 contract (C…) of the x402 asset — its Stellar Asset Contract (SAC).
   // Derived from X402_ASSET_CODE + X402_ASSET_ISSUER when unset (#776).
+  AGENT_POLICY_ACCOUNT: z
+    .string()
+    .refine((val) => isValidStellarContractId(val), {
+      message: 'AGENT_POLICY_ACCOUNT must be a valid contract address (C…)',
+    })
+    .optional(),
   X402_ASSET_CONTRACT: z
     .string()
     .refine((val) => isValidStellarContractId(val), {
@@ -153,24 +182,22 @@ export const EnvSchema = z.object({
   // Unset = any asset, but a known code must still use its configured issuer.
   X402_ALLOWED_ASSETS: z
     .string()
-    .refine(
-      (val) =>
-        val
-          .split(',')
-          .map((entry) => entry.trim())
-          .every((entry) => {
-            if (entry === 'XLM') return true;
-            const [code, issuer, ...extra] = entry.split(':');
-            return (
-              extra.length === 0 &&
-              !!code &&
-              code.length <= 12 &&
-              !!issuer &&
-              isValidStellarPublicKey(issuer)
-            );
-          }),
-      { message: 'X402_ALLOWED_ASSETS must be a comma-separated list of "XLM" or "CODE:ISSUER"' }
-    )
+    .refine(isValidAssetAllowlist, {
+      message: 'X402_ALLOWED_ASSETS must be a comma-separated list of "XLM" or "CODE:ISSUER"',
+    })
+    .optional(),
+
+  // Comma-separated allowlist of tokens the backend will accept as an escrow
+  // `token` argument, each "XLM" or "CODE:ISSUER" (#989). Unset = only native
+  // XLM and the default x402 asset (X402_ASSET_CODE/ISSUER) are accepted — the
+  // backend never passes an arbitrary, unverified token contract to the escrow
+  // contract's initialize()/initialize_with_fee(), since a malicious token
+  // can lie about transfer()/balances or re-enter.
+  ESCROW_ALLOWED_TOKENS: z
+    .string()
+    .refine(isValidAssetAllowlist, {
+      message: 'ESCROW_ALLOWED_TOKENS must be a comma-separated list of "XLM" or "CODE:ISSUER"',
+    })
     .optional(),
 
   // Spending cap
@@ -228,47 +255,9 @@ export const EnvSchema = z.object({
   // How long a pending approval waits for a decision before it expires.
   APPROVAL_TTL_MS: z.coerce.number().int().min(1_000).default(3_600_000),
 
-  /**
-   * Named approver credentials (#954): 'name:sha256hex,...' — each approver
-   * gets their own token, distinct from ADMIN_API_TOKEN, so the audit trail
-   * can say who decided and (optionally) require several of them to agree.
-   * The token itself is never stored, only its SHA-256 hex digest.
-   */
-  APPROVER_TOKENS: z
-    .string()
-    .optional()
-    .refine(
-      (val) => {
-        if (!val) return true;
-        const hashRe = /^[0-9a-f]{64}$/i;
-        for (const entry of val.split(',')) {
-          const parts = entry.trim().split(':');
-          if (parts.length !== 2) return false;
-          const [name, hash] = parts as [string, string];
-          if (!name || !hashRe.test(hash)) return false;
-        }
-        return true;
-      },
-      {
-        message:
-          "APPROVER_TOKENS must be a comma-separated list of 'name:sha256hex', " +
-          "e.g. 'alice:9f86d0...,bob:2c26b4...'",
-      }
-    ),
-  /**
-   * Above this amount, an approval needs APPROVAL_MIN_APPROVERS distinct
-   * approvers to agree before it executes (#954). Unset = single-approver
-   * mode for every amount, regardless of APPROVAL_THRESHOLD(S).
-   */
-  APPROVAL_MULTI_APPROVER_THRESHOLD: z
-    .string()
-    .regex(
-      /^(?!0+(\.0+)?$)\d+(\.\d{1,7})?$/,
-      "APPROVAL_MULTI_APPROVER_THRESHOLD must be a positive decimal (e.g. '5000')"
-    )
-    .optional(),
-  // Distinct approvers required above APPROVAL_MULTI_APPROVER_THRESHOLD.
-  APPROVAL_MIN_APPROVERS: z.coerce.number().int().min(2).default(2),
+  // How often the MPP channel sweeper marks timed-out channels Expired and
+  // releases their spending reservations. Defaults to 60,000 (1 minute).
+  MPP_SESSION_SWEEP_INTERVAL_MS: z.coerce.number().int().min(1_000).default(60_000),
 
   // Counterparty policy for value-moving tasks: `allowlist` permits only the
   // listed destinations, `denylist` blocks them, `open` (default) permits any.
@@ -287,6 +276,14 @@ export const EnvSchema = z.object({
   // Shared Postgres store for multi-instance deployments (#822).
   STORAGE_BACKEND: z.enum(['sqlite', 'postgres']).default('sqlite'),
   DATABASE_URL: z.string().min(1).optional(),
+
+  // Data retention (#963): how long to keep rows in tables that otherwise
+  // grow without bound. The hash-chained audit log is never pruned.
+  RETENTION_DAYS_RESULTS: z.coerce.number().int().positive().default(30),
+  RETENTION_DAYS_APPROVALS: z.coerce.number().int().positive().default(30),
+  RETENTION_DAYS_TRIGGER_EVENTS: z.coerce.number().int().positive().default(30),
+  // How often the retention job sweeps every table above (default: daily).
+  RETENTION_JOB_INTERVAL_MS: z.coerce.number().int().min(1_000).default(86_400_000),
 
   // Logging
   NODE_ENV: z.string().min(1).default('development'),
@@ -352,6 +349,19 @@ export const EnvSchema = z.object({
   // Health check HTTP server
   HEALTH_PORT: z.coerce.number().int().min(1).max(65535).default(3000),
 
+  /**
+   * Payments above this amount (in the agent's asset) are held for human
+   * approval before execution rather than submitted immediately.
+   * "0" disables the threshold (all tasks execute immediately).
+   * Defaults to "0" (threshold disabled).
+   */
+  APPROVAL_THRESHOLD: z
+    .string()
+    .regex(
+      /^\d+(\.\d{1,7})?$/,
+      "APPROVAL_THRESHOLD must be a non-negative decimal (e.g. '50' or '0')"
+    )
+    .default("0"),
   // Nano node RPC endpoint used by NanoPaymentTool.
   NANO_RPC_URL: z.string().url().default('http://127.0.0.1:7076'),
   // Nano signing seed (#975). Loaded from env or AWS Secrets Manager, never
@@ -383,6 +393,18 @@ export const EnvSchema = z.object({
   // Maximum JSON body size accepted by the MCP HTTP endpoint (in bytes).
   // Requests that exceed this limit are rejected with 413. Defaults to 1 MiB.
   MCP_MAX_BODY_BYTES: z.coerce.number().int().min(1024).default(1_048_576),
+
+  // Triggers
+  TRIGGER_ALLOW_PAYMENTS: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  // How long to retain deduplication event records before pruning.
+  TRIGGER_EVENTS_RETENTION_MS: z.coerce
+    .number()
+    .int()
+    .min(60_000) // minimum 1 minute
+    .default(7 * 24 * 60 * 60 * 1000), // 7 days
 
   // Contract event listener polling interval in milliseconds.
   CONTRACT_EVENT_POLL_MS: z.coerce.number().int().min(100).optional(),
@@ -589,11 +611,22 @@ export interface AgentConfig {
    */
   readonly DATABASE_URL?: string | undefined;
 
+  /** Days to keep persisted agent_results rows before the retention job deletes them (#963). */
+  readonly RETENTION_DAYS_RESULTS: number;
+  /** Days to keep decided/expired pending_approvals rows before the retention job deletes them (#963). */
+  readonly RETENTION_DAYS_APPROVALS: number;
+  /** Days to keep trigger_events dedupe rows before the retention job deletes them (#963). */
+  readonly RETENTION_DAYS_TRIGGER_EVENTS: number;
+  /** How often the retention job runs, in milliseconds. Defaults to once a day. */
+  readonly RETENTION_JOB_INTERVAL_MS: number;
+
   /**
    * The asset code for the x402 / PayFi asset.
    * Validated by EnvSchema to be a string between 1 and 12 characters.
    * Defaults to "USDC".
    */
+  /** Optional Soroban custom account used for policy-protected spending. */
+  readonly AGENT_POLICY_ACCOUNT?: string | undefined;
   readonly X402_ASSET_CODE: string;
 
   /**
@@ -640,21 +673,11 @@ export interface AgentConfig {
   readonly APPROVAL_TTL_MS: number;
 
   /**
-   * Parsed form of APPROVER_TOKENS (#954): approver name to the SHA-256 hex
-   * digest of their token. Empty when APPROVER_TOKENS is unset — approval
-   * decisions are then only attributed to "admin" (the shared API token).
+   * MPP channel sweep interval in milliseconds. The sweeper marks channels
+   * past their `timeoutAt` as `Expired` and releases their reservations.
+   * Defaults to 60,000 (1 minute).
    */
-  readonly APPROVER_TOKENS_MAP: ReadonlyMap<string, string>;
-
-  /**
-   * Above this amount, an approval needs APPROVAL_MIN_APPROVERS distinct
-   * approvers before it executes (#954). Optional — unset keeps the
-   * single-approver behaviour for every amount.
-   */
-  readonly APPROVAL_MULTI_APPROVER_THRESHOLD?: string | undefined;
-
-  /** Distinct approvers required above APPROVAL_MULTI_APPROVER_THRESHOLD. Defaults to 2. */
-  readonly APPROVAL_MIN_APPROVERS: number;
+  readonly MPP_SESSION_SWEEP_INTERVAL_MS: number;
 
   /**
    * Counterparty policy enforced for every value-moving task.
@@ -723,6 +746,14 @@ export interface AgentConfig {
    * known code (X402_ASSET_CODE) must use its configured issuer.
    */
   readonly X402_ALLOWED_ASSETS?: string | undefined;
+
+  /**
+   * Comma-separated allowlist of tokens the backend will accept as an escrow
+   * `token` argument, each "XLM" or "CODE:ISSUER". Optional — when unset,
+   * only native XLM and the default x402 asset (X402_ASSET_CODE/ISSUER) are
+   * accepted (#989).
+   */
+  readonly ESCROW_ALLOWED_TOKENS?: string | undefined;
   readonly AGENT_SECRET_KEY_ARN?: string | undefined;
 
   /**
@@ -880,12 +911,33 @@ export interface AgentConfig {
    * Requests exceeding this limit receive a 413 response. Defaults to 1 MiB.
    */
   readonly MCP_MAX_BODY_BYTES: number;
+
+  /**
+   * When true, value-moving triggers (e.g., stellar_payment, multisig_payment)
+   * can be created and executed. When false (default), attempting to create
+   * a value-moving trigger throws an error.
+   */
+  readonly TRIGGER_ALLOW_PAYMENTS: boolean;
+
+  /**
+   * How long (ms) to retain deduplication event records before pruning.
+   * Prevents unbounded growth of the trigger_events table.
+   * Defaults to 7 days (604,800,000 ms).
+   */
+  readonly TRIGGER_EVENTS_RETENTION_MS: number;
+
   /**
    * Port for the health-check HTTP server.
    * Validated by EnvSchema to be an integer between 1 and 65535.
    * Defaults to 3000.
    */
   readonly HEALTH_PORT: number;
+
+  /**
+   * Comma-separated allowlist of exact origins the health server's CORS
+   * preflight handling accepts. Optional — unset means no CORS (#966).
+   */
+  readonly CORS_ALLOWED_ORIGINS?: string | undefined;
 
   /** LLM request budget in tokens. Defaults to 8,000. */
   readonly LLM_MAX_TOKENS_PER_REQUEST: number;
@@ -911,6 +963,11 @@ export interface AgentConfig {
   readonly WEBHOOK_URL?: string | undefined;
   readonly WEBHOOK_SECRET?: string | undefined;
   /**
+   * Payments above this amount are held for human approval before execution.
+   * "0" means threshold is disabled — all tasks execute immediately.
+   * Defaults to "0".
+   */
+  readonly APPROVAL_THRESHOLD: string;
    * Bearer token required by the HTTP API. Separate from WEBHOOK_SECRET so
    * leaking one does not compromise the other. When unset WEBHOOK_SECRET is
    * accepted in its place (deprecated).
@@ -1085,8 +1142,8 @@ function parseConfigAndDerive(
 
   // ── Mainnet safety guard ───────────────────────────────────────────────────
   if (raw.STELLAR_NETWORK === 'mainnet') {
-    const limit = parseFloat(raw.AGENT_SPENDING_LIMIT);
-    if (limit > MAINNET_SPENDING_CAP) {
+    const limitStroops = tryToStroops(raw.AGENT_SPENDING_LIMIT);
+    if (limitStroops !== null && limitStroops > toStroops(String(MAINNET_SPENDING_CAP))) {
       process.stderr.write(
         `❌ [Config] AGENT_SPENDING_LIMIT (${raw.AGENT_SPENDING_LIMIT}) exceeds ` +
           `the mainnet safety cap of ${MAINNET_SPENDING_CAP.toLocaleString('en-US')}. Lower it or explicitly override.\n`
@@ -1240,6 +1297,7 @@ function parseConfigAndDerive(
     OTLP_ENDPOINT,
     WEBHOOK_URL,
     WEBHOOK_SECRET,
+    APPROVAL_THRESHOLD,
     DATABASE_URL,
     LLM_API_KEY: llmApiKey,
     VAULT_TOKEN: vaultToken,
@@ -1270,12 +1328,19 @@ function parseConfigAndDerive(
     MAX_X402_PAYMENTS_PER_MINUTE: raw.MAX_X402_PAYMENTS_PER_MINUTE,
     X402_NONCE_TTL_MS: raw.X402_NONCE_TTL_MS,
     MAX_SOROBAN_FEE_STROOPS: raw.MAX_SOROBAN_FEE_STROOPS,
+    APPROVAL_THRESHOLD,
+    ...(ALLOWED_X402_ORIGINS && { ALLOWED_X402_ORIGINS }),
+    ...(AGENT_SECRET_KEY_ARN && { AGENT_SECRET_KEY_ARN }),
+    ...(OTLP_ENDPOINT && { OTLP_ENDPOINT }),
+    ...(WEBHOOK_URL && { WEBHOOK_URL }),
+    ...(WEBHOOK_SECRET && { WEBHOOK_SECRET }),
     SPENDING_LIMITS_MAP: spendingLimitsMap,
     APPROVAL_THRESHOLDS_MAP: approvalThresholdsMap,
     APPROVER_TOKENS_MAP: approverTokensMap,
     SPENDING_LIMITS_ALLOW_UNKNOWN: raw.SPENDING_LIMITS_ALLOW_UNKNOWN,
     PAYMENT_DESTINATIONS: paymentDestinations,
     X402_ASSET_CONTRACT: x402AssetContract,
+    ...(raw.AGENT_POLICY_ACCOUNT ? { AGENT_POLICY_ACCOUNT: raw.AGENT_POLICY_ACCOUNT } : {}),
     ...(ALLOWED_X402_ORIGINS ? { ALLOWED_X402_ORIGINS } : {}),
     ...(AGENT_SECRET_KEY_ARN ? { AGENT_SECRET_KEY_ARN } : {}),
     ...(OTLP_ENDPOINT ? { OTLP_ENDPOINT } : {}),

@@ -10,13 +10,13 @@ import { db } from './db/client';
 import { createLogger } from './utils/logger';
 import { initTelemetry, shutdownTelemetry } from './telemetry';
 import { configPromise } from './config';
-import { startKillSwitchSync } from './kill_switch';
+import { startMppSessionSweeper, sweepExpiredChannels } from './payments/mpp_session';
 
 const log = createLogger('process');
 
 let agent: PayFiAgent;
 let healthServer: any;
-let stopKillSwitchSync: (() => void) | undefined;
+let stopChannelSweeper: (() => void) | undefined;
 const HARD_KILL_MS = 10_000;
 // Leave headroom inside the hard-kill window for the remaining teardown steps.
 export const PENDING_TASKS_TIMEOUT_MS = 8_000;
@@ -43,15 +43,17 @@ async function shutdown(signal: string): Promise<void> {
       await agent.waitForPendingTasks(PENDING_TASKS_TIMEOUT_MS);
     }
 
-    // 3. Stop the health check server
+    // 3. Stop the health check server and the MPP channel sweeper
+    stopChannelSweeper?.();
+    stopChannelSweeper = undefined;
     if (healthServer) {
       await new Promise<void>((resolve, reject) =>
         healthServer.close((err?: Error) => (err ? reject(err) : resolve()))
       );
     }
 
-    // 4. Stop the kill-switch sync poller
-    stopKillSwitchSync?.();
+    // 4. Stop the retention sweep
+    stopRetentionJob?.();
 
     // 5. Close database connection
     await db.close();
@@ -83,7 +85,14 @@ async function start() {
 
   agent = new PayFiAgent();
   healthServer = startHealthServer(agent);
-  stopKillSwitchSync = startKillSwitchSync();
+  stopRetentionJob = startRetentionJob();
+
+  // Sweep MPP channels past their timeout once at boot, then on an interval,
+  // so expired channels release their spending reservations and alert operators.
+  void sweepExpiredChannels().catch((err) =>
+    log.error({ error: String(err) }, 'Startup MPP channel sweep failed')
+  );
+  stopChannelSweeper = startMppSessionSweeper();
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
