@@ -9,6 +9,13 @@ import { PayFiAgent, AgentTask } from './agent';
 import { config } from './config';
 import { createLogger } from './utils/logger';
 import { getDb } from './persistence';
+import { toStroops, stroopsToString } from './utils/amount';
+import { listen as listenContractEvents } from './tools/ContractEventListener';
+import { watchContractStorage, ContractStorageWatcherOptions } from './tools/ContractStorageWatcherTool';
+import { xdr } from '@stellar/stellar-sdk';
+
+// Re-export for testing
+export { listenContractEvents, watchContractStorage };
 
 const log = createLogger('triggers');
 
@@ -17,6 +24,8 @@ export type TriggerSource = 'payment' | 'contract_event' | 'storage_change';
 export interface TriggerFilter {
   /** Filter by source asset code (e.g., 'USDC') */
   assetCode?: string;
+  /** Filter by asset issuer (required for non-XLM assets) */
+  assetIssuer?: string;
   /** Filter by sender public key */
   from?: string;
   /** Filter by amount threshold */
@@ -106,12 +115,21 @@ async function recordTriggerFired(triggerId: string, eventId: string): Promise<b
 /**
  * Check if event matches trigger filter.
  */
-function matchesFilter(event: unknown, filter: TriggerFilter): boolean {
+export function matchesFilter(event: unknown, filter: TriggerFilter): boolean {
   const e = event as Record<string, unknown>;
 
   if (filter.assetCode) {
-    const eventAsset = (e.assetCode as string) ?? (e.asset as string);
-    if (eventAsset !== filter.assetCode) return false;
+    const eventAssetCode = (e.assetCode as string) ?? (e.asset as string);
+    // For non-XLM assets, require assetIssuer match too
+    if (filter.assetCode !== 'XLM' && filter.assetIssuer) {
+      const eventAssetIssuer = (e.assetIssuer as string) ?? '';
+      if (eventAssetCode !== filter.assetCode || eventAssetIssuer !== filter.assetIssuer) {
+        return false;
+      }
+    } else {
+      // For XLM or when no issuer specified, match only on code
+      if (eventAssetCode !== filter.assetCode) return false;
+    }
   }
 
   if (filter.from) {
@@ -119,9 +137,17 @@ function matchesFilter(event: unknown, filter: TriggerFilter): boolean {
   }
 
   if (filter.minAmount) {
-    const eventAmount = parseFloat(String(e.amount ?? e.value ?? '0'));
-    const minAmount = parseFloat(filter.minAmount);
-    if (eventAmount < minAmount) return false;
+    const eventAmount = e.amount ?? e.value ?? '0';
+    const minAmount = filter.minAmount;
+    // Use BigInt stroop comparison to avoid float precision issues
+    try {
+      const eventStroops = toStroops(String(eventAmount));
+      const minStroops = toStroops(minAmount);
+      if (eventStroops < minStroops) return false;
+    } catch {
+      // If amount is invalid, treat as 0
+      return false;
+    }
   }
 
   if (filter.contractId) {
@@ -145,6 +171,8 @@ export class TriggerManager {
   private unlistenPayment?: () => void;
   private unlistenContract?: () => void;
   private unlistenStorage?: () => void;
+  private contractWatchers = new Map<string, { stop: () => void; triggers: Set<string> }>();
+  private storageWatchers = new Map<string, { stop: () => void; triggers: Set<string> }>();
 
   constructor(agent: PayFiAgent) {
     this.agent = agent;
@@ -170,6 +198,7 @@ export class TriggerManager {
     this.agent.startListening('trigger', async (challenge) => {
       const payment = {
         assetCode: challenge.assetCode,
+        assetIssuer: challenge.assetIssuer,
         from: challenge.payTo, // Incoming payment
         amount: challenge.amount,
       };
@@ -205,11 +234,113 @@ export class TriggerManager {
   }
 
   private setupContractListener(): void {
-    // Contract events are set up per-contract
+    // Group triggers by contractId
+    const contractTriggers = new Map<string, Trigger[]>();
+
+    for (const [id, trigger] of this.triggers) {
+      if (!trigger.enabled || trigger.source !== 'contract_event') continue;
+      if (!trigger.filter.contractId) continue;
+      const triggers = contractTriggers.get(trigger.filter.contractId) ?? [];
+      triggers.push(trigger);
+      contractTriggers.set(trigger.filter.contractId, triggers);
+    }
+
+    // Set up a listener for each contractId with contract_event triggers
+    for (const [contractId, triggers] of contractTriggers) {
+      const eventTypes = triggers
+        .map((t) => t.filter.eventTopics ?? [])
+        .flat()
+        .filter((v, i, a) => a.indexOf(v) === i); // dedupe
+
+      const handle = listenContractEvents(
+        contractId,
+        eventTypes,
+        (event) => {
+          this.handleContractEvent(contractId, event, triggers);
+        },
+        { maxReconnectAttempts: 5 }
+      );
+
+      this.contractWatchers.set(contractId, {
+        stop: () => {
+          handle.stop();
+          handle.removeAllListeners();
+        },
+        triggers: new Set(triggers.map((t) => t.id)),
+      });
+    }
+
+    this.unlistenContract = () => {
+      for (const { stop } of this.contractWatchers.values()) {
+        stop();
+      }
+      this.contractWatchers.clear();
+    };
   }
 
   private setupStorageListener(): void {
-    // Storage changes are set up per-contract
+    // Group triggers by contractId
+    const contractOptions = new Map<string, ContractStorageWatcherOptions>();
+
+    for (const [id, trigger] of this.triggers) {
+      if (!trigger.enabled || trigger.source !== 'storage_change') continue;
+      if (!trigger.filter.contractId) continue;
+      if (!trigger.filter.storageKey) continue;
+
+      const contractId = trigger.filter.contractId;
+      const options = contractOptions.get(contractId);
+
+      if (options) {
+        options.keys.push(trigger.filter.storageKey);
+      } else {
+        // Parse storageKey string to xdr.LedgerKey
+        let keys: (xdr.LedgerKey | xdr.ScVal | string)[] = [];
+        try {
+          keys.push(xdr.LedgerKey.fromXDR(trigger.filter.storageKey, 'base64'));
+        } catch {
+          try {
+            const scVal = xdr.ScVal.fromXDR(trigger.filter.storageKey, 'base64');
+            keys.push(scVal);
+          } catch {
+            keys.push(trigger.filter.storageKey);
+          }
+        }
+
+        contractOptions.set(contractId, {
+          contractId,
+          keys,
+          pollIntervalMs: config.CONTRACT_EVENT_POLL_MS || 5000,
+        });
+      }
+    }
+
+    // Set up a watcher for each contractId with storage_change triggers
+    for (const [contractId, options] of contractOptions) {
+      const handle = watchContractStorage(options);
+
+      handle.on('change', (event) => {
+        this.handleStorageChange(contractId, event);
+      });
+
+      this.storageWatchers.set(contractId, {
+        stop: () => {
+          handle.stop();
+          handle.removeAllListeners();
+        },
+        triggers: new Set(
+          Array.from(this.triggers.values())
+            .filter((t) => t.enabled && t.source === 'storage_change' && t.filter.contractId === contractId)
+            .map((t) => t.id)
+        ),
+      });
+    }
+
+    this.unlistenStorage = () => {
+      for (const { stop } of this.storageWatchers.values()) {
+        stop();
+      }
+      this.storageWatchers.clear();
+    };
   }
 
   /**
@@ -220,6 +351,15 @@ export class TriggerManager {
     filter: TriggerFilter;
     task: AgentTask;
   }): Promise<Trigger> {
+    const { filter } = options;
+
+    // Validate that non-native assets have assetIssuer specified
+    if (filter.assetCode && filter.assetCode !== 'XLM' && !filter.assetIssuer) {
+      throw new Error(
+        `assetIssuer is required for non-XLM asset trigger (assetCode: ${filter.assetCode})`
+      );
+    }
+
     const trigger: Trigger = {
       id: `trig_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
       source: options.source,
@@ -265,13 +405,88 @@ export class TriggerManager {
   }
 
   /**
+   * Handle contract event and fire matching triggers.
+   */
+  private async handleContractEvent(contractId: string, event: any, triggers: Trigger[]): Promise<void> {
+    const e = {
+      contractId,
+      topics: (event.topic ?? []).map((t: any) => t.toString()),
+      value: event.value?.toXDR?.('base64') ?? event.value ?? null,
+      ledger: event.ledger,
+    };
+
+    for (const trigger of triggers) {
+      if (!trigger.enabled || trigger.filter.contractId !== contractId) continue;
+      if (!matchesFilter(e, trigger.filter)) continue;
+
+      // Dedupe by event ID (contract event ID)
+      const eventId = event.id;
+      const isNew = await recordTriggerFired(trigger.id, eventId);
+      if (!isNew) continue;
+
+      log.info({ triggerId: trigger.id, eventId }, 'Contract event trigger firing');
+      await this.agent.run(trigger.task);
+
+      // Update last fired
+      trigger.lastFiredAt = new Date().toISOString();
+      await saveTrigger(trigger);
+    }
+  }
+
+  /**
+   * Handle storage change and fire matching triggers.
+   */
+  private async handleStorageChange(contractId: string, change: any): Promise<void> {
+    const e = {
+      contractId,
+      storageKey: change.keyXdr,
+      oldValue: change.oldValue,
+      newValue: change.newValue,
+      ledger: change.ledger,
+    };
+
+    for (const [id, trigger] of this.triggers) {
+      if (!trigger.enabled || trigger.source !== 'storage_change') continue;
+      if (trigger.filter.contractId !== contractId) continue;
+      if (trigger.filter.storageKey && trigger.filter.storageKey !== change.keyXdr) continue;
+
+      // Dedupe by ledger + key
+      const eventId = `${e.ledger ?? 'unknown'}:${change.keyXdr}`;
+      const isNew = await recordTriggerFired(id, eventId);
+      if (!isNew) continue;
+
+      log.info({ triggerId: id, eventId }, 'Storage change trigger firing');
+      await this.agent.run(trigger.task);
+
+      // Update last fired
+      trigger.lastFiredAt = new Date().toISOString();
+      await saveTrigger(trigger);
+    }
+  }
+
+  /**
    * Stop all listeners and cleanup.
    */
   stop(): void {
     this.agent.stopListening();
     this.agent.stopContractListener();
     this.agent.stopStorageWatcher();
+    
+    // Stop contract event watchers
+    if (this.unlistenContract) {
+      this.unlistenContract();
+    }
+    
+    // Stop storage watchers
+    if (this.unlistenStorage) {
+      this.unlistenStorage();
+    }
+    
     this.triggers.clear();
+    this.contractWatchers.clear();
+    this.storageWatchers.clear();
     log.info('TriggerManager stopped');
   }
 }
+
+
