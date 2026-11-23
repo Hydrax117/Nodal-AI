@@ -28,6 +28,15 @@ export function saveResult(result: PersistedResult): void {
   sqlite.saveResult(result);
 }
 
+/**
+ * Drop agent_results rows older than `beforeIso` (#963). ISO-8601 timestamps
+ * compare correctly as plain strings, so no numeric conversion is needed.
+ */
+export function pruneResults(beforeIso: string): number {
+  const result = getDb().prepare(`DELETE FROM agent_results WHERE timestamp < ?`).run(beforeIso);
+  return result.changes;
+}
+
 export function getResults(limit = 100, offset = 0): PersistedResult[] {
   return sqlite.getResults(limit, offset);
 }

@@ -52,10 +52,13 @@ async function shutdown(signal: string): Promise<void> {
       );
     }
 
-    // 4. Close database connection
+    // 4. Stop the retention sweep
+    stopRetentionJob?.();
+
+    // 5. Close database connection
     await db.close();
 
-    // 5. Shut down telemetry (flushes pending spans)
+    // 6. Shut down telemetry (flushes pending spans)
     await shutdownTelemetry();
 
     clearTimeout(hardKill);
@@ -82,6 +85,7 @@ async function start() {
 
   agent = new PayFiAgent();
   healthServer = startHealthServer(agent);
+  stopRetentionJob = startRetentionJob();
 
   // Sweep MPP channels past their timeout once at boot, then on an interval,
   // so expired channels release their spending reservations and alert operators.

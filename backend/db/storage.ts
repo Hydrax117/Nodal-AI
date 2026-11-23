@@ -53,6 +53,8 @@ export interface Storage {
 
   saveResult(result: PersistedResult): Promise<void>;
   getResults(limit?: number, offset?: number): Promise<PersistedResult[]>;
+  /** Drop agent_results rows older than `beforeIso` (#963). */
+  pruneResults(beforeIso: string): Promise<void>;
 
   appendAuditEntry(entry: AuditEntry): Promise<AuditRow>;
   getAuditLog(): Promise<AuditRow[]>;
@@ -157,6 +159,10 @@ export class SqliteStorage implements Storage {
 
   async getResults(limit?: number, offset?: number): Promise<PersistedResult[]> {
     return sqlite.getResults(limit, offset);
+  }
+
+  async pruneResults(beforeIso: string): Promise<void> {
+    persistence.pruneResults(beforeIso);
   }
 
   async appendAuditEntry(entry: AuditEntry): Promise<AuditRow> {
