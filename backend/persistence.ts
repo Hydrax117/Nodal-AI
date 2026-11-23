@@ -564,7 +564,7 @@ function computePayloadHash(payload: unknown): string {
 /**
  * Result status for idempotency tracking.
  */
-type IdempotencyStatus = 'pending' | 'success' | 'failure';
+type IdempotencyStatus = 'pending' | 'in_progress' | 'success' | 'failure';
 
 /**
  * Stored idempotency record.
@@ -651,6 +651,72 @@ export function saveIdempotencyResult(
     now,
     expiresAt
   );
+}
+
+/**
+ * How long an in_progress claim holds a key. If the worker crashes mid-flight
+ * the claim expires after this window and the key can be claimed again, so a
+ * crash can never permanently brick a key (#951).
+ */
+export const IDEMPOTENCY_IN_PROGRESS_TTL_MS = 5 * 60 * 1000;
+
+export type IdempotencyClaim =
+  | { status: 'claimed' }
+  | { status: 'in_progress' }
+  | { status: 'conflict' }
+  | { status: 'cached'; result: AgentResult };
+
+/**
+ * Atomically claim an idempotency key before executing (#951).
+ *
+ * Inserts an `in_progress` row with `ON CONFLICT DO NOTHING`; only the request
+ * whose insert lands owns the key and may execute. Others see the existing row:
+ * a different payload is a conflict, a live in_progress row means another
+ * request is executing, and a final row is returned as the cached result.
+ * Expired rows (including stale in_progress claims) are removed first.
+ */
+export function claimIdempotencyKey(
+  key: string,
+  taskType: string,
+  payload: unknown,
+  inProgressTtlMs: number = IDEMPOTENCY_IN_PROGRESS_TTL_MS
+): IdempotencyClaim {
+  const db = getDb();
+  const now = Date.now();
+  const payloadHash = computePayloadHash(payload);
+
+  db.prepare(`DELETE FROM idempotency_keys WHERE key = ? AND expiresAt < ?`).run(key, now);
+
+  const inserted = db
+    .prepare(
+      `INSERT INTO idempotency_keys
+         (key, payloadHash, taskType, status, result, createdAt, expiresAt)
+       VALUES (?, ?, ?, 'in_progress', '{}', ?, ?)
+       ON CONFLICT(key) DO NOTHING`
+    )
+    .run(key, payloadHash, taskType, now, now + inProgressTtlMs);
+  if (inserted.changes > 0) return { status: 'claimed' };
+
+  const row = db
+    .prepare(`SELECT payloadHash, status, result FROM idempotency_keys WHERE key = ?`)
+    .get(key) as { payloadHash: string; status: string; result: string } | undefined;
+
+  // Row vanished between insert and select (released concurrently) — retry once.
+  if (!row) return claimIdempotencyKey(key, taskType, payload, inProgressTtlMs);
+  if (row.payloadHash !== payloadHash) return { status: 'conflict' };
+  if (row.status === 'in_progress') return { status: 'in_progress' };
+  return { status: 'cached', result: JSON.parse(row.result) as AgentResult };
+}
+
+/**
+ * Release an in_progress claim without caching a result, so a retry with the
+ * same key re-executes (used for transient failures, #950). Final results are
+ * never deleted by this call.
+ */
+export function releaseIdempotencyKey(key: string): void {
+  getDb()
+    .prepare(`DELETE FROM idempotency_keys WHERE key = ? AND status = 'in_progress'`)
+    .run(key);
 }
 
 /**

@@ -25,7 +25,8 @@ import {
   listPendingApprovals,
   decideApproval,
   expirePendingApprovals,
-  getIdempotencyResult,
+  claimIdempotencyKey,
+  releaseIdempotencyKey,
   saveIdempotencyResult,
   pruneIdempotencyKeys,
   PendingApproval,
@@ -540,6 +541,8 @@ export interface AgentResult {
    * (e.g., InsufficientFunds, NetworkTimeout) without string matching.
    */
   errorType?: string;
+  /** Suggested HTTP status for API layers (e.g. 409 for IdempotencyInProgress). */
+  statusCode?: number;
   /**
    * Correlation ID that ties every log line, persisted result, and webhook
    * dispatch for a single task execution together. Generated at dispatch time
@@ -565,25 +568,39 @@ export interface AgentResult {
  * halted while the kill switch is engaged; every other task is read-only and
  * keeps working.
  */
-export const VALUE_MOVING_TASK_TYPES: ReadonlySet<TaskType> = new Set<TaskType>([
-  'stellar_payment',
-  'soroban_invoke',
-  'x402_respond',
-  'change_trust',
-  'multisig_payment',
-  'batch_payment',
-  'path_payment',
-  'fee_bump',
-  'dex_offer',
-  'liquidity_pool',
-  'data_entry',
-  'sequence_number',
-  'sponsored_account',
-  'soroban_deploy',
-  'swap',
-  'set_options',
-  'cross_border_payment',
+export const VALUE_MOVING_TASK_TYPES: ReadonlySet<TaskType> = new Set<TaskType>(
+  // Derived from the builtin tool registry's `valueMoving` flag (#949) so the
+  // set cannot drift from the tool definitions. The tools are only inspected
+  // here, never executed, so a placeholder signer is sufficient.
+  createBuiltinTools(createAgentSigner())
+    .filter((tool) => tool.valueMoving)
+    .map((tool) => tool.name as TaskType)
+);
+
+/**
+ * Error types that are transient: the idempotency key is released rather than
+ * cached so a retry with the same key re-executes (#950). Everything else
+ * (validation, policy, insufficient funds / op_underfunded, contract and tx
+ * failures) is definitive and cached.
+ */
+const RETRYABLE_ERROR_TYPES: ReadonlySet<string> = new Set<string>([
+  ErrorType.NetworkTimeout,
+  ErrorType.RateLimitError,
+  ErrorType.SimulationBudgetExceeded,
+  ErrorType.AgentPaused,
+  ErrorType.PendingApproval,
+  ErrorType.AgentShuttingDown,
+  ErrorType.IdempotencyInProgress,
+  ErrorType.UnknownError,
 ]);
+
+/** True when a failed result is transient and must not be cached under its idempotency key. */
+export function isRetryableFailure(result: AgentResult): boolean {
+  if (result.success) return false;
+  // No errorType (e.g. capacity rejection) means nothing definitive happened.
+  if (!result.errorType) return true;
+  return RETRYABLE_ERROR_TYPES.has(result.errorType);
+}
 
 // ─── Middleware types ─────────────────────────────────────────────────────────────
 
@@ -1250,27 +1267,62 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
       return this.shuttingDownResult(task, correlationId);
     }
 
-    // ── Idempotency check (#payment-idempotency) ─────────────────────────────
-    if (task.idempotencyKey) {
-      const existing = getIdempotencyResult(task.idempotencyKey, task.payload);
-      if (existing && 'conflict' in existing) {
-        return {
-          success: false,
-          taskType: task.type,
-          error: `Idempotency key "${task.idempotencyKey}" already used with a different payload`,
-          errorType: ErrorType.IdempotencyConflict,
-          correlationId,
-        };
-      }
-      if (existing) {
-        taskLog.info(
-          { idempotencyKey: task.idempotencyKey },
-          'Returning cached result for idempotent request'
-        );
-        return { ...existing, correlationId };
-      }
+    if (!task.idempotencyKey) {
+      return this.dispatch(task, correlationId, taskLog);
     }
 
+    // ── Idempotency claim (#payment-idempotency, #950, #951) ─────────────────
+    // Atomically claim the key with an in_progress record before executing so
+    // two concurrent requests with the same key cannot both execute.
+    const key = task.idempotencyKey;
+    const claim = claimIdempotencyKey(key, task.type, task.payload);
+    if (claim.status === 'conflict') {
+      return {
+        success: false,
+        taskType: task.type,
+        error: `Idempotency key "${key}" already used with a different payload`,
+        errorType: ErrorType.IdempotencyConflict,
+        correlationId,
+      };
+    }
+    if (claim.status === 'in_progress') {
+      return {
+        success: false,
+        taskType: task.type,
+        error: `A request with idempotency key "${key}" is already in progress`,
+        errorType: ErrorType.IdempotencyInProgress,
+        statusCode: 409,
+        correlationId,
+      };
+    }
+    if (claim.status === 'cached') {
+      taskLog.info({ idempotencyKey: key }, 'Returning cached result for idempotent request');
+      return { ...claim.result, correlationId };
+    }
+
+    let result: AgentResult;
+    try {
+      result = await this.dispatch(task, correlationId, taskLog);
+    } catch (err) {
+      releaseIdempotencyKey(key);
+      throw err;
+    }
+    // Cache successes and definitive failures; release the key on transient
+    // failures so a retry with the same key re-executes (#950).
+    if (result.success || !isRetryableFailure(result)) {
+      saveIdempotencyResult(key, task.type, task.payload, result);
+    } else {
+      releaseIdempotencyKey(key);
+    }
+    return result;
+  }
+
+  /** Capacity check + execution, after the idempotency claim. */
+  private async dispatch(
+    task: AgentTask,
+    correlationId: string,
+    taskLog: ReturnType<typeof createLogger>
+  ): Promise<AgentResult> {
     // ── Concurrency rate limit — queue when saturated if queueCapacity allows,
     // otherwise reject ──
     if (this.activeTasks >= config.MAX_CONCURRENT_TASKS) {
@@ -1565,11 +1617,6 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
         const timestamp = new Date().toISOString();
         saveResult({ ...result, timestamp });
 
-        // Store idempotency result if key provided (#payment-idempotency)
-        if (task.idempotencyKey) {
-          saveIdempotencyResult(task.idempotencyKey, task.type, task.payload, result);
-        }
-
         // The transaction is already on-chain at this point, so an audit-log
         // failure is logged loudly rather than reported as a task failure that
         // could prompt the caller to resubmit the payment.
@@ -1612,11 +1659,6 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
         // Persist failed result (#failed-results-persistence)
         const timestamp = new Date().toISOString();
         saveResult({ ...result, timestamp });
-
-        // Store idempotency result for failures too (#payment-idempotency)
-        if (task.idempotencyKey) {
-          saveIdempotencyResult(task.idempotencyKey, task.type, task.payload, result);
-        }
 
         void dispatchWebhook(result);
         return result;
@@ -1686,11 +1728,6 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
       // Persist middleware failure result
       const timestamp = new Date().toISOString();
       saveResult({ ...result, timestamp });
-
-      // Store idempotency result for middleware failures too
-      if (task.idempotencyKey) {
-        saveIdempotencyResult(task.idempotencyKey, task.type, task.payload, result);
-      }
 
       void dispatchWebhook(result);
       return result;
