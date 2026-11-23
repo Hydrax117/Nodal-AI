@@ -355,6 +355,18 @@ export const EnvSchema = z.object({
   // Requests that exceed this limit are rejected with 413. Defaults to 1 MiB.
   MCP_MAX_BODY_BYTES: z.coerce.number().int().min(1024).default(1_048_576),
 
+  // Triggers
+  TRIGGER_ALLOW_PAYMENTS: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  // How long to retain deduplication event records before pruning.
+  TRIGGER_EVENTS_RETENTION_MS: z.coerce
+    .number()
+    .int()
+    .min(60_000) // minimum 1 minute
+    .default(7 * 24 * 60 * 60 * 1000), // 7 days
+
   // Contract event listener polling interval in milliseconds.
   CONTRACT_EVENT_POLL_MS: z.coerce.number().int().min(100).optional(),
 
@@ -848,6 +860,21 @@ export interface AgentConfig {
    * Requests exceeding this limit receive a 413 response. Defaults to 1 MiB.
    */
   readonly MCP_MAX_BODY_BYTES: number;
+
+  /**
+   * When true, value-moving triggers (e.g., stellar_payment, multisig_payment)
+   * can be created and executed. When false (default), attempting to create
+   * a value-moving trigger throws an error.
+   */
+  readonly TRIGGER_ALLOW_PAYMENTS: boolean;
+
+  /**
+   * How long (ms) to retain deduplication event records before pruning.
+   * Prevents unbounded growth of the trigger_events table.
+   * Defaults to 7 days (604,800,000 ms).
+   */
+  readonly TRIGGER_EVENTS_RETENTION_MS: number;
+
   /**
    * Port for the health-check HTTP server.
    * Validated by EnvSchema to be an integer between 1 and 65535.

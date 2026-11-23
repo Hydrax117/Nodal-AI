@@ -74,6 +74,7 @@ vi.mock('../backend/config', () => {
     MCP_PORT: 3001,
     MCP_HOST: '127.0.0.1',
     MCP_MAX_BODY_BYTES: 1_048_576,
+    TRIGGER_ALLOW_PAYMENTS: false,
     HEALTH_PORT: 3000,
     NANO_ENABLED: false,
     OTEL_REDACT_TX_HASH: false,
