@@ -26,6 +26,5 @@ Thumbs.db
 .coverage
 coverage/
 
-# Local implementation notes / change summaries
-CHANGES-*.md
-IMPLEMENTATION_NOTES.md
+# Local session notes (not committed)
+SESSION_CHANGES.md

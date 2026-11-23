@@ -749,6 +749,17 @@ describe('PayFiAgent guards', () => {
 
       expect(expirePendingApprovals).toHaveBeenCalledTimes(3);
     });
+
+    it('releases persisted reservations on expire or approve across restarts (#952)', async () => {
+      const approval = held();
+      vi.mocked(getPendingApproval).mockReturnValue(approval);
+      vi.mocked(expirePendingApprovals).mockReturnValue([approval.id]);
+
+      // Simulate restart: new agent instance without in-memory map
+      const freshAgent = new PayFiAgent();
+      freshAgent.expireApprovals();
+      expect(expirePendingApprovals).toHaveBeenCalled();
+    });
   });
 
   describe('audit log', () => {

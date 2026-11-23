@@ -182,6 +182,14 @@ docker compose --profile postgres run --rm test-runner-postgres
 
 Schema changes are numbered SQL files in [`backend/db/migrations/`](./backend/db/migrations/) (`postgres/` holds the Postgres equivalents). Pending files are applied at startup inside a transaction and recorded in `schema_version`. To change the schema, add the next `NNN_<name>.sql` for both backends. Never edit a migration that has already shipped.
 
+### Data Retention (#963)
+
+`agent_results`, decided/expired `pending_approvals` and `trigger_events` dedupe rows grow without bound for a long-running agent. A daily job (`backend/retention.ts`, interval set by `RETENTION_JOB_INTERVAL_MS`) deletes rows older than `RETENTION_DAYS_RESULTS`, `RETENTION_DAYS_APPROVALS` and `RETENTION_DAYS_TRIGGER_EVENTS` respectively (all default to 30 days), and opportunistically prunes expired idempotency keys and x402 rate-limit records past their own windows. The hash-chained `audit_log` is never touched — pruning it would break the chain. Run the same sweep on demand, or from an external cron instead of in-process, with:
+
+```bash
+npm run db:prune
+```
+
 ### Visual Dashboard
 
 A web-based dashboard provides real-time monitoring and control of your Nodal agent:
@@ -734,6 +742,7 @@ Each value below is a `BuiltinTaskType` wired into `PayFiAgent.run()` in `backen
 | `offer_book` | `OfferBookTool` | Query the Stellar DEX order book for an asset pair and return bids, asks, and the top-of-book spread. Read-only. |
 | `cross_border_payment` | `CrossBorderPaymentTool` | SEP-31 payment as the sending anchor: SEP-12 KYC for sender and receiver, optional SEP-38 firm quote, SEP-31 transaction, then the on-chain payment with the anchor's memo. Spending limit enforced. |
 | `soroban_storage` | `SorobanStorageTool` | Read a Soroban contract's storage entry (`persistent`, `temporary`, or `instance`) and return the decoded value. Read-only. |
+| `claimable_balance` | `ClaimableBalanceTool` | Create a Stellar claimable balance for one or more claimants, or claim one the agent is entitled to. Spending limit enforced on create. |
 
 > **Standalone use:** read-only tools such as `BalanceCheckTool` (`backend/tools/BalanceCheckTool.ts`) and `SorobanQueryTool` (`backend/tools/SorobanQueryTool.ts`) can also be imported and used directly, outside the agent task loop, when you only need a query.
 
@@ -763,6 +772,7 @@ Input wrapper for task dispatch. The `payload` shape depends on `type`:
 - `network_status`: no payload fields (pass `{}`)
 - `offer_book`: `{ sellingAsset: string | { code: string; issuer?: string }; buyingAsset: string | { code: string; issuer?: string }; limit?: number }` (string assets are `"XLM"`, `"native"` or `"CODE:ISSUER"`; `limit` is 1–200)
 - `soroban_storage`: `{ contractId: string; keys: unknown[]; durability?: "persistent" | "temporary" | "instance" }` (exactly one key; `durability` defaults to `"persistent"`)
+- `claimable_balance`: `{ action: "create"; assetCode: string; assetIssuer?: string; amount: string; claimants: { destination: string; predicate?: ClaimPredicate }[] } | { action: "claim"; balanceId: string }` (spending limit enforced on `create`; `claim` verifies the agent is a listed claimant before submitting)
 - `swap`: `{ sellAsset: { code: string; issuer?: string }; buyAsset: { code: string; issuer?: string }; sellAmount: string; maxSlippagePct: number }` (`maxSlippagePct` is 0–100)
 - `account_history`: `{ publicKey?: string; limit?: number; cursor?: string; assetCode?: string }` (`limit` is 1–200, default 10, and counts *matching* payments after non-`payment` operations and the `assetCode` filter are dropped; the tool pages through Horizon to fill it, up to 5 pages per call. The result adds `pagesFetched` and `pageLimitReached` — when `pageLimitReached` is true, fewer than `limit` records does not mean history is exhausted; continue from `nextCursor`)
 - `soroban_deploy`: `{ action: "upload" | "deploy"; wasm?: Buffer | string; wasmBuffer?: Buffer | string }` or `{ action: "instantiate"; wasmHash: string }` — `upload`/`deploy` require WASM bytes (a `Buffer`, file path, hex or base64 string)

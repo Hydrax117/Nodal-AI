@@ -8,9 +8,7 @@
 import { PayFiAgent, AgentTask, TaskType, VALUE_MOVING_TASK_TYPES } from './agent';
 import { config } from './config';
 import { createLogger } from './utils/logger';
-import { getDb } from './persistence';
-import { listen as listenContractEvents } from './tools/ContractEventListener';
-import { watchContractStorage, type StorageChangeEvent } from './tools/ContractStorageWatcherTool';
+import { getStorage } from './db/storage';
 
 const log = createLogger('triggers');
 
@@ -100,50 +98,14 @@ export interface Trigger {
  * Persist trigger to database.
  */
 async function saveTrigger(trigger: Trigger): Promise<void> {
-  getDb()
-    .prepare(
-      `INSERT OR REPLACE INTO triggers (id, source, filter, task, enabled, created_at, last_fired_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      trigger.id,
-      trigger.source,
-      JSON.stringify(trigger.filter),
-      JSON.stringify(trigger.task),
-      trigger.enabled ? 1 : 0,
-      trigger.createdAt,
-      trigger.lastFiredAt ?? null
-    );
+  await getStorage().saveTrigger(trigger);
 }
 
 /**
  * Load all triggers from database.
  */
 async function loadTriggers(): Promise<Trigger[]> {
-  try {
-    const rows = getDb().prepare('SELECT * FROM triggers').all() as Array<{
-      id: string;
-      source: string;
-      filter: string;
-      task: string;
-      enabled: number;
-      created_at: string;
-      last_fired_at: string | null;
-    }>;
-
-    return rows.map((row) => ({
-      id: row.id,
-      source: row.source as TriggerSource,
-      filter: JSON.parse(row.filter),
-      task: JSON.parse(row.task),
-      enabled: row.enabled === 1,
-      createdAt: row.created_at,
-      ...(row.last_fired_at !== null ? { lastFiredAt: row.last_fired_at } : {}),
-    }));
-  } catch {
-    // Table doesn't exist yet
-    return [];
-  }
+  return getStorage().loadTriggers();
 }
 
 /**
@@ -181,25 +143,22 @@ function generateStorageChangeEventId(change: StorageChangeEvent): string {
  * Prunes old records when the threshold is reached to prevent unbounded growth.
  */
 async function recordTriggerFired(triggerId: string, eventId: string): Promise<boolean> {
-  const key = `trigger:${triggerId}:event:${eventId}`;
-  // One atomic statement: of two concurrent deliveries of the same event only
-  // one inserts the row, so a check-then-insert race cannot fire it twice.
-  const info = getDb()
-    .prepare('INSERT OR IGNORE INTO trigger_events (key, fired_at) VALUES (?, ?)')
-    .run(key, new Date().toISOString());
+  return getStorage().recordTriggerFired(triggerId, eventId);
+}
 
-  // Prune old records periodically to prevent unbounded growth
-  // Do this only after some inserts to avoid excessive pruning
-  if (info.changes === 1) {
-    const totalRows = getDb()
-      .prepare('SELECT COUNT(*) as count FROM trigger_events')
-      .get() as { count: number };
-    if (totalRows.count > 10000) {
-      pruneOldTriggerEvents();
-    }
+/**
+ * Drop trigger_events dedupe rows fired before `beforeIso` (#963). These
+ * exist only to make `recordTriggerFired` idempotent for a bounded replay
+ * window, so old rows carry no lasting value.
+ */
+export function pruneTriggerEvents(beforeIso: string): number {
+  try {
+    const result = getDb().prepare('DELETE FROM trigger_events WHERE fired_at < ?').run(beforeIso);
+    return result.changes;
+  } catch {
+    // Table doesn't exist yet
+    return 0;
   }
-
-  return info.changes === 1; // 0 = already fired for this event
 }
 
 /**
@@ -218,9 +177,13 @@ function matchesFilter(event: unknown, filter: TriggerFilter): boolean {
   }
 
   if (filter.minAmount) {
-    const eventAmount = parseFloat(String(e.amount ?? e.value ?? '0'));
-    const minAmount = parseFloat(filter.minAmount);
-    if (eventAmount < minAmount) return false;
+    const eventStroops = tryToStroops(String(e.amount ?? e.value ?? '0'));
+    const minStroops = tryToStroops(filter.minAmount);
+    if (eventStroops !== null && minStroops !== null) {
+      if (eventStroops < minStroops) return false;
+    } else {
+      return false;
+    }
   }
 
   if (filter.contractId) {
@@ -283,6 +246,17 @@ export class TriggerManager {
         // Dedupe by on-chain event ID (immutable, network-controlled)
         const isNew = await recordTriggerFired(id, eventId);
         if (!isNew) continue;
+
+        // Check spending limit before execution
+        const p = trigger.task.payload as Record<string, unknown>;
+        if (p.amount) {
+          const limitStroops = tryToStroops(config.AGENT_SPENDING_LIMIT);
+          const amountStroops = tryToStroops(String(p.amount));
+          if (amountStroops !== null && limitStroops !== null && amountStroops > limitStroops) {
+            log.warn({ triggerId: id, amount: String(p.amount) }, 'Trigger exceeds spending limit');
+            continue;
+          }
+        }
 
         log.info({ triggerId: id, eventId }, 'Trigger firing');
         await this.agent.run(trigger.task);
@@ -467,7 +441,7 @@ export class TriggerManager {
    */
   async deleteTrigger(id: string): Promise<void> {
     this.triggers.delete(id);
-    getDb().prepare('DELETE FROM triggers WHERE id = ?').run(id);
+    await getStorage().deleteTrigger(id);
     log.info({ triggerId: id }, 'Trigger deleted');
   }
 
