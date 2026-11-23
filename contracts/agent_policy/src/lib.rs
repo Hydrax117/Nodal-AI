@@ -87,6 +87,7 @@ pub struct PolicyState {
     // NOTE: This struct is part of the `agent_policy` crate which should be included in the workspace defined at `contracts/Cargo.toml`.
 
     pub owner: Address,
+    pub agent_key: BytesN<32>,
     pub token: Address,
     pub limit: i128,
     pub window: u64,
@@ -261,6 +262,11 @@ impl AgentPolicyAccount {
     pub fn get_policy(env: Env) -> PolicyState {
         PolicyState {
             owner: Self::owner(&env),
+            agent_key: env
+                .storage()
+                .instance()
+                .get(&DataKey::AgentKey)
+                .expect("policy: state corrupted"),
             token: env
                 .storage()
                 .instance()
@@ -388,6 +394,15 @@ impl CustomAccountInterface for AgentPolicyAccount {
         if total == 0 {
             Self::extend_instance_ttl(&env);
             return Ok(());
+        }
+
+        let frozen: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Frozen)
+            .ok_or(PolicyError::NotInitialized)?;
+        if frozen {
+            return Err(PolicyError::Frozen);
         }
 
         let limit: i128 = env
