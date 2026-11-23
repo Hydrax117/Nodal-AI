@@ -364,6 +364,11 @@ export const EnvSchema = z.object({
     .default("0"),
   // Nano node RPC endpoint used by NanoPaymentTool.
   NANO_RPC_URL: z.string().url().default('http://127.0.0.1:7076'),
+  // Operator-controlled exception for bypassing Nano recipient prechecks.
+  NANO_ALLOW_SKIP_PRECHECK: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
   // Nano signing seed (#975). Loaded from env or AWS Secrets Manager, never
   // from a task payload. Required at startup when NANO_ENABLED=true.
   NANO_ENABLED: z
@@ -954,8 +959,10 @@ export interface AgentConfig {
   /** Maximum concurrent in-memory sessions. Defaults to 500. */
   readonly SESSION_MAX_SESSIONS: number;
 
-  /** Nano node RPC endpoint used by NanoPaymentTool (default: http://127.0.0.1:7076). */
+  /** Nano node RPC endpoint (default local HTTP; HTTPS required on mainnet). */
   readonly NANO_RPC_URL: string;
+  /** Whether operators allow Nano payments to bypass recipient prechecks. */
+  readonly NANO_ALLOW_SKIP_PRECHECK: boolean;
   /** Whether the nano_payment task is enabled (requires NANO_SEED or NANO_SEED_ARN). */
   readonly NANO_ENABLED: boolean;
   readonly NANO_SEED_ARN?: string | undefined;
@@ -1090,7 +1097,7 @@ function parseConfigAndDerive(
   const raw: RawEnv = result.data;
 
   // ── Mainnet HTTPS enforcement ──────────────────────────────────────────────
-  // On mainnet, both RPC endpoints MUST use HTTPS to prevent credential/data
+  // On mainnet, all RPC endpoints MUST use HTTPS to prevent credential/data
   // exposure over unencrypted connections. Testnet and futurenet permit HTTP
   // for local devnets and CI environments.
   if (raw.STELLAR_NETWORK === 'mainnet') {
@@ -1102,6 +1109,9 @@ function parseConfigAndDerive(
       httpsErrors.push(
         `  • SOROBAN_RPC_URL: must use HTTPS on mainnet (got: ${raw.SOROBAN_RPC_URL})`
       );
+    }
+    if (!raw.NANO_RPC_URL.startsWith('https://')) {
+      httpsErrors.push(`  • NANO_RPC_URL: must use HTTPS on mainnet (got: ${raw.NANO_RPC_URL})`);
     }
     if (httpsErrors.length > 0) {
       process.stderr.write(

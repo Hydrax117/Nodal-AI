@@ -94,7 +94,7 @@ export function createBuiltinTools(signer: Signer = createAgentSigner()): AgentT
       name: 'nano_payment',
       description:
         'Send a feeless Nano micro-payment. Amounts are raw units; pre-checks that the ' +
-        'recipient account is open unless skipPrecheck is set.',
+        'recipient account is open. Pre-check bypass is available only when enabled by an operator.',
       inputSchema: NanoPaymentInputSchema,
       valueMoving: true,
       execute: (input) => nanoPaymentTool.execute(input),
