@@ -134,6 +134,25 @@ export class SimulationBudgetError extends StructuredError {
   }
 }
 
+/**
+ * Thrown by MPP Session's `closeChannel()` and `disputeChannel()` because the
+ * on-chain escrow contract is not yet deployed.
+ *
+ * The channel protocol is a **prototype / simulation** — commitments are
+ * persisted off-chain but no Soroban settlement transaction is ever submitted.
+ * Callers must not treat the channel as settled until a real on-chain
+ * implementation is in place.
+ *
+ * This error is also thrown by `openChannel()` when `STELLAR_NETWORK` is
+ * `'mainnet'`, since simulated channels must never be used in production.
+ */
+export class SimulatedChannelError extends StructuredError {
+  constructor(message: string, cause?: unknown) {
+    super(message, ErrorType.ValidationError, cause);
+    Object.setPrototypeOf(this, SimulatedChannelError.prototype);
+  }
+}
+
 export class AgentPausedError extends StructuredError {
   constructor(message: string, cause?: unknown) {
     super(message, ErrorType.AgentPaused, cause);

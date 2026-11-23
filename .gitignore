@@ -25,3 +25,6 @@ Thumbs.db
 .stryker-tmp/
 .coverage
 coverage/
+
+# Local change notes (not for version control)
+changes/
