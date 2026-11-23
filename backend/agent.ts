@@ -458,7 +458,6 @@ export type TaskPayloadMap = {
     amountRaw: string;
     senderAccount?: string;
     senderSeed?: string;
-    rpcUrl?: string;
     skipPrecheck?: boolean;
   };
   soroban_query: { contractId: string; key: string };
